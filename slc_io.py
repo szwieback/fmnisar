@@ -5,6 +5,36 @@ import numpy as np
 from pathlib import Path
 
 
+def read_block(path, az_start, az_stop, rg_start, rg_stop, freq='A', pol='HH'):
+    """Read a 2D block from an RSLC file.
+
+    Parameters
+    ----------
+    path : str or Path
+    az_start, az_stop : int or None
+        Azimuth line indices (start inclusive, stop exclusive). None means full extent.
+    rg_start, rg_stop : int
+        Range bin indices (start inclusive, stop exclusive).
+    freq : str
+        Frequency band, e.g. 'A' or 'B'.
+    pol : str
+        Polarization, e.g. 'HH', 'HV', 'VH', 'VV'.
+
+    Returns
+    -------
+    np.ndarray, shape (az_stop - az_start, rg_stop - rg_start), complex64
+    """
+    ds_path = f'science/LSAR/RSLC/swaths/frequency{freq}/{pol}'
+    with h5py.File(path, 'r') as fh:
+        if ds_path not in fh:
+            avail = list(fh[f'science/LSAR/RSLC/swaths/frequency{freq}'].keys())
+            raise KeyError(f'Dataset not found: {ds_path}. Available: {avail}')
+        block = fh[ds_path][az_start:az_stop, rg_start:rg_stop]
+        if block.dtype.names is not None and {'r', 'i'} <= set(block.dtype.names):
+            block = block['r'].astype(np.float32) + 1j * block['i'].astype(np.float32)
+    return block.astype(np.complex64)
+
+
 def read_range_block(path, rg_start, rg_stop, freq='A', pol='HH'):
     """Read a contiguous range block across all azimuth lines from an RSLC file.
 
@@ -22,15 +52,7 @@ def read_range_block(path, rg_start, rg_stop, freq='A', pol='HH'):
     -------
     np.ndarray, shape (n_az, rg_stop - rg_start), complex64
     """
-    ds_path = f'science/LSAR/RSLC/swaths/frequency{freq}/{pol}'
-    with h5py.File(path, 'r') as fh:
-        if ds_path not in fh:
-            avail = list(fh[f'science/LSAR/RSLC/swaths/frequency{freq}'].keys())
-            raise KeyError(f'Dataset not found: {ds_path}. Available: {avail}')
-        block = fh[ds_path][:, rg_start:rg_stop]
-        if block.dtype.names is not None and {'r', 'i'} <= set(block.dtype.names):
-            block = block['r'].astype(np.float32) + 1j * block['i'].astype(np.float32)
-    return block.astype(np.complex64)
+    return read_block(path, None, None, rg_start, rg_stop, freq=freq, pol=pol)
 
 
 def get_available_pols(fh: h5py.File, freq: str) -> list:

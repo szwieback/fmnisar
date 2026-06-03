@@ -6,12 +6,13 @@ Created on Jun 2, 2026
 from dataclasses import dataclass
 from pathlib import Path
 from scipy.fft import next_fast_len
+from scipy.interpolate import RegularGridInterpolator
 import warnings
 import numpy as np
 import h5py
 
 from inspect_nisar import extract_rslc_params
-from slc_io import read_range_block, get_available_pols, copy_h5_structure
+from slc_io import read_block, get_available_pols, copy_h5_structure
 
 
 @dataclass
@@ -22,6 +23,8 @@ class SubapertureMetaData:
     doppler_centroid: np.ndarray       # (n_az, n_rg) Hz; on the coarse grid
     doppler_az_time: np.ndarray        # (n_az,) zeroDopplerTime coords [s]
     doppler_slant_range: np.ndarray    # (n_rg,) slant-range coords [m]
+    az_time: np.ndarray                # (n_az_full,) full-res zeroDopplerTime [s]
+    slant_range: np.ndarray            # (n_rg_full,) full-res slantRange [m]
 
     @classmethod
     def load_from_rslc(cls, fh: h5py.File, freq: str = 'A') -> 'SubapertureMetaData':
@@ -44,6 +47,8 @@ class SubapertureMetaData:
             doppler_centroid=fh[f'{base_proc}/dopplerCentroid'][()],
             doppler_az_time=fh[f'{base_proc}/zeroDopplerTime'][()],
             doppler_slant_range=fh[f'{base_proc}/slantRange'][()],
+            az_time=fh['science/LSAR/RSLC/swaths/zeroDopplerTime'][()],
+            slant_range=fh[f'{base_swath}/slantRange'][()],
         )
 
     @classmethod
@@ -67,6 +72,8 @@ class AzimuthSubaperture:
     Works on level-1 SLC data. Currently assumes a spatially uniform doppler centroid. 
     Subapertures can optionally be demodulated to baseband. At the end, the doppler centroid modulation
     of the full-azimuth-bandwitdth image is not re-applied by default.
+    
+    # To do: multicore, metadata, resample
     """
 
     def __init__(
@@ -94,9 +101,9 @@ class AzimuthSubaperture:
         block_zp[:block.shape[0], :] = block
         return block_zp
 
-    def _demodulate(self, block_zp, dc, zdts):
+    def _demodulate(self, block_zp, dc, zdts, az_time_start=0.0):
         N = block_zp.shape[0]
-        az_time = np.arange(N) * zdts
+        az_time = az_time_start + np.arange(N) * zdts
         modulation = np.exp(2j * np.pi * dc * az_time)
         return block_zp * modulation.conj()[:, np.newaxis], modulation
 
@@ -118,7 +125,7 @@ class AzimuthSubaperture:
     def _apply_subaperture_windows(self, spectrum, bin_centroids, bin_width):
         spectrum_sub = np.zeros((self.n_subapertures,) + spectrum.shape, dtype=np.complex64)
         for j, centroid in enumerate(bin_centroids):
-            win = raised_cosine_window(spectrum.shape[0], centroid, bin_width, beta=self.raised_cosine_beta)
+            win = construct_raised_cosine(spectrum.shape[0], centroid, bin_width, beta=self.raised_cosine_beta)
             spectrum_sub[j] = spectrum * win[:, np.newaxis]
         return spectrum_sub
 
@@ -133,7 +140,7 @@ class AzimuthSubaperture:
             block_sub *= modulation[np.newaxis, :, np.newaxis]
         return block_sub[:, :N_orig, :]
 
-    def _process_block(self, block, dc=None, zdts=None, az_bw=None):
+    def _process_block(self, block, dc=None, zdts=None, az_bw=None, az_time_start=0.0):
         if dc is None:
             dc = float(np.mean(self.meta.doppler_centroid))
         if zdts is None:
@@ -143,11 +150,98 @@ class AzimuthSubaperture:
 
         N_orig = block.shape[0]
         block_zp = self._zero_pad(block)
-        block_zp, modulation = self._demodulate(block_zp, dc, zdts)
+        block_zp, modulation = self._demodulate(block_zp, dc, zdts, az_time_start=az_time_start)
         spectrum = self._compute_spectrum(block_zp)
         bin_width, bin_centroids = self._compute_subaperture_params(block_zp.shape[0], az_bw, zdts)
         spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width)
         return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, N_orig)
+
+    def _build_dc_interpolator(self) -> RegularGridInterpolator:
+        return RegularGridInterpolator(
+            (self.meta.doppler_az_time, self.meta.doppler_slant_range),
+            self.meta.doppler_centroid,
+            method='linear',
+            bounds_error=False,
+            fill_value=None,
+        )
+
+    def _setup_output_h5(self, src, dst, freq, pols, n_az, n_rg, blocksize_range):
+        swath_grp = src[f'science/LSAR/RSLC/swaths/frequency{freq}']
+        skip_paths = {swath_grp[pol].name for pol in pols}
+        copy_h5_structure(src['/'], dst['/'], skip=skip_paths)
+        out_swath = dst[f'science/LSAR/RSLC/swaths/frequency{freq}']
+        for pol in pols:
+            ds = out_swath.create_dataset(
+                pol,
+                shape=(self.n_subapertures, n_az, n_rg),
+                dtype=np.complex64,
+                chunks=(1, min(256, n_az), min(blocksize_range, n_rg)),
+            )
+            ds.attrs['description'] = (
+                f'Subaperture SLC for polarization {pol}; '
+                f'dim 0 = subaperture index (0..{self.n_subapertures - 1})'
+            )
+        return out_swath
+
+    @staticmethod
+    def _iter_blocks(n_az, n_rg, blocksize_az, blocksize_range):
+        az_starts = range(0, n_az, blocksize_az) if blocksize_az is not None else [0]
+        for az_start in az_starts:
+            az_stop = min(az_start + blocksize_az, n_az) if blocksize_az is not None else n_az
+            for rg_start in range(0, n_rg, blocksize_range):
+                yield az_start, az_stop, rg_start, min(rg_start + blocksize_range, n_rg)
+
+    def _run_blocks(self, rslc_path, output_h5, freq, pols, blocksize_range, blocksize_az,
+                    dc_for_block):
+        warnings.warn(
+            "Output HDF5 metadata is copied verbatim from the NISAR RSLC source; "
+            "product-level metadata (e.g. product type, doppler centroid) "
+            "is not updated and needs to be reviewed and fixed.",
+            UserWarning,
+            stacklevel=3,
+        )
+        rslc_path = Path(rslc_path)
+        with h5py.File(rslc_path, 'r') as src:
+            if pols is None:
+                pols = get_available_pols(src, freq)
+            n_az, n_rg = src[f'science/LSAR/RSLC/swaths/frequency{freq}/{pols[0]}'].shape
+            with h5py.File(output_h5, 'w') as dst:
+                out_swath = self._setup_output_h5(src, dst, freq, pols, n_az, n_rg, blocksize_range)
+                for az_start, az_stop, rg_start, rg_stop in \
+                        self._iter_blocks(n_az, n_rg, blocksize_az, blocksize_range):
+                    dc = dc_for_block(az_start, az_stop, rg_start, rg_stop)
+                    az_time_start = float(self.meta.az_time[az_start])
+                    for pol in pols:
+                        block = read_block(rslc_path, az_start, az_stop, rg_start, rg_stop,
+                                           freq=freq, pol=pol)
+                        sub_block = self._process_block(block, dc=dc, az_time_start=az_time_start)
+                        out_swath[pol][:, az_start:az_stop, rg_start:rg_stop] = sub_block
+
+    def process_rslc_uniform_dc(
+        self,
+        rslc_path: Path,
+        output_h5: Path,
+        freq: str = 'A',
+        pols: list = None,
+        blocksize_range: int = 512,
+    ) -> None:
+        """Process an RSLC into subapertures using the scene-mean Doppler centroid.
+
+        Parameters
+        ----------
+        rslc_path : Path
+        output_h5 : Path
+            Output HDF5 (created or overwritten).
+        freq : str
+            Frequency band, ``'A'`` or ``'B'``.
+        pols : list of str, optional
+            Polarizations to process. Defaults to all available.
+        blocksize_range : int
+            Range bins per block.
+        """
+        mean_dc = float(np.mean(self.meta.doppler_centroid))
+        self._run_blocks(rslc_path, output_h5, freq, pols, blocksize_range,
+                         blocksize_az=None, dc_for_block=lambda *_: mean_dc)
 
     def process_rslc(
         self,
@@ -156,71 +250,40 @@ class AzimuthSubaperture:
         freq: str = 'A',
         pols: list = None,
         blocksize_range: int = 512,
+        blocksize_az: int = None,
     ) -> None:
-        """Process all polarizations of an RSLC image into subapertures and write to HDF5.
+        """Process an RSLC into subapertures with per-block interpolated Doppler centroid.
 
-        Uses the scene-mean Doppler centroid. Loops over range bins in blocks of
-        *blocksize_range*. Output layout mirrors the NISAR RSLC swath group with an
-        extra leading subaperture dimension; polarization datasets are complex64.
+        Interpolates the Doppler centroid to each block center using bilinear
+        interpolation on the coarse DC grid. ``blocksize_az=None`` processes the full
+        azimuth extent as a single block.
 
         Parameters
         ----------
         rslc_path : Path
-            Path to the NISAR RSLC HDF5 file.
         output_h5 : Path
-            Path for the output HDF5 file (created or overwritten).
+            Output HDF5 (created or overwritten).
         freq : str
             Frequency band, ``'A'`` or ``'B'``.
         pols : list of str, optional
-            Polarizations to process. Defaults to all available in the file.
+            Polarizations to process. Defaults to all available.
         blocksize_range : int
-            Number of range bins processed per block.
+            Range bins per block.
+        blocksize_az : int or None
+            Azimuth lines per block. ``None`` uses the full azimuth extent as one block.
         """
-        warnings.warn(
-            "Output HDF5 metadata is copied verbatim from the NISAR RSLC source; "
-            "product-level metadata (e.g. product type, bandwidth, frequency label) "
-            "is not updated and needs to be reviewed and fixed.",
-            UserWarning,
-            stacklevel=2,
-        )
+        rgi = self._build_dc_interpolator()
 
-        rslc_path = Path(rslc_path)
-        mean_dc = float(np.mean(self.meta.doppler_centroid))
+        def dc_for_block(az_start, az_stop, rg_start, rg_stop):
+            az_center = self.meta.az_time[(az_start + az_stop) // 2]
+            rg_center = self.meta.slant_range[(rg_start + rg_stop) // 2]
+            return float(rgi([[az_center, rg_center]]))
 
-        with h5py.File(rslc_path, 'r') as src:
-            if pols is None:
-                pols = get_available_pols(src, freq)
-
-            swath_grp = src[f'science/LSAR/RSLC/swaths/frequency{freq}']
-            n_az, n_rg = swath_grp[pols[0]].shape
-            skip_paths = {swath_grp[pol].name for pol in pols}
-
-            with h5py.File(output_h5, 'w') as dst:
-                copy_h5_structure(src['/'], dst['/'], skip=skip_paths)
-
-                out_swath = dst[f'science/LSAR/RSLC/swaths/frequency{freq}']
-                for pol in pols:
-                    ds = out_swath.create_dataset(
-                        pol,
-                        shape=(self.n_subapertures, n_az, n_rg),
-                        dtype=np.complex64,
-                        chunks=(1, min(256, n_az), min(blocksize_range, n_rg)),
-                    )
-                    ds.attrs['description'] = (
-                        f'Subaperture SLC for polarization {pol}; '
-                        f'dim 0 = subaperture index (0..{self.n_subapertures - 1})'
-                    )
-
-                for rg_start in range(0, n_rg, blocksize_range):
-                    rg_stop = min(rg_start + blocksize_range, n_rg)
-                    for pol in pols:
-                        block = read_range_block(rslc_path, rg_start, rg_stop, freq=freq, pol=pol)
-                        sub_block = self._process_block(block, dc=mean_dc)
-                        # sub_block: (n_subapertures, n_az, rg_stop - rg_start), complex64
-                        out_swath[pol][:, :, rg_start:rg_stop] = sub_block
+        self._run_blocks(rslc_path, output_h5, freq, pols, blocksize_range,
+                         blocksize_az=blocksize_az, dc_for_block=dc_for_block)
 
 
-def raised_cosine_window(n, bin_centroid, bin_width, beta=0.5):
+def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
     # bin indices are after fftshift, from 0 to n-1
     rc = np.zeros(n, dtype=np.float32)
     bin_rolloff_hwidth = int((beta * bin_width) // 2)
@@ -330,7 +393,7 @@ def plot_subaperture_diagnostics(
     ax_win2 = ax_win.twinx()
     bin_indices = np.arange(N)
     for centroid, color in zip(bin_centroids, colors):
-        win = raised_cosine_window(N, int(centroid), int(bin_width), beta=sub.raised_cosine_beta)
+        win = construct_raised_cosine(N, int(centroid), int(bin_width), beta=sub.raised_cosine_beta)
         ax_win2.plot(bin_indices, win.real, color=color, alpha=0.7)
         ax_win.axvline(centroid, c='#aaaaaa', alpha=0.5, zorder=2)
     ax_win2.set_ylim(0, 1.5)
@@ -350,13 +413,16 @@ if __name__ == '__main__':
     path_nisar = p0 / 'NISAR_L1_PR_RSLC_010_073_D_053_4005_DHDH_A_20260114T062318_20260114T062355_X05010_N_F_J_001.h5'
 
     meta = SubapertureMetaData.load_from_rslc_path(path_nisar)
+    dc = meta.doppler_centroid
     block = np.load(p0 / 'block.npy')
 
     sub = AzimuthSubaperture(meta)
 
     # plot_subaperture_diagnostics(sub, block)
     
-    path_out = p0 / 'subaperture' / 'uniform_doppler_centroid.h5'
-    sub.process_rslc(path_nisar, path_out, pols=['HH'])
+    folder_out = Path('/media/simon/Extreme SSD/fmnisar/')
+    sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
+    sub.process_rslc(path_nisar, folder_out /  'variable_doppler_centroid.h5', pols=['HH'])
+    
     
     
