@@ -1,0 +1,16 @@
+# PyCharm
+.idea/
+
+# LiClipse / Eclipse
+.project
+.pydevproject
+.settings/
+.metadata/
+
+# Claude Code
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
