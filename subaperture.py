@@ -5,13 +5,12 @@ Created on Jun 2, 2026
 '''
 from dataclasses import dataclass
 from pathlib import Path
-from scipy.fft import next_fast_len
+from scipy.fft import fft, ifft, fftshift, ifftshift, fftfreq, next_fast_len
 from scipy.interpolate import RegularGridInterpolator
 import warnings
 import numpy as np
 import h5py
 
-from inspect_nisar import extract_rslc_params
 from slc_io import read_block, get_available_pols, copy_h5_structure
 
 
@@ -108,7 +107,8 @@ class AzimuthSubaperture:
         return block_zp * modulation.conj()[:, np.newaxis], modulation
 
     def _compute_spectrum(self, block_zp):
-        return np.fft.fftshift(np.fft.fft(block_zp, axis=0), axes=0)
+        # TODO: implement antenna pattern de-windowing
+        return fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
 
     def _compute_subaperture_params(self, N, az_bw, zdts):
         fraction_useful = az_bw * zdts * (1 - self.shrink_fraction_useful)
@@ -131,7 +131,7 @@ class AzimuthSubaperture:
 
     def _invert_subapertures(self, spectrum_sub, bin_centroids, modulation, N_orig):
         N = spectrum_sub.shape[1]
-        block_sub = np.fft.ifft(np.fft.ifftshift(spectrum_sub, axes=1), axis=1)
+        block_sub = ifft(ifftshift(spectrum_sub, axes=1), axis=1, workers=-1)
         if self.demodulate_subaperture:
             for j, centroid in enumerate(bin_centroids):
                 sub_mod = np.exp(2j * np.pi * (centroid - N // 2) * np.arange(N) / N)
@@ -283,6 +283,7 @@ class AzimuthSubaperture:
                          blocksize_az=blocksize_az, dc_for_block=dc_for_block)
 
 
+# TODO: shares Tukey/raised-cosine kernel with ISCE3 range split-spectrum; candidate for a shared window utility
 def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
     # bin indices are after fftshift, from 0 to n-1
     rc = np.zeros(n, dtype=np.float32)
@@ -341,8 +342,8 @@ def plot_subaperture_diagnostics(
     # Frequency-domain: power spectra of SLC and each subaperture
     N_slc = block.shape[0]
     N_sub = block_subaperture.shape[1]
-    freqs_slc = np.fft.fftshift(np.fft.fftfreq(N_slc, d=zdts))
-    freqs_sub = np.fft.fftshift(np.fft.fftfreq(N_sub, d=zdts))
+    freqs_slc = fftshift(fftfreq(N_slc, d=zdts))
+    freqs_sub = fftshift(fftfreq(N_sub, d=zdts))
 
     if demodulate:
         mod_slc = np.exp(-2j * np.pi * dc * np.arange(N_slc) * zdts)
@@ -354,12 +355,12 @@ def plot_subaperture_diagnostics(
         sub_input = block_subaperture
 
     slc_spec = np.mean(
-        np.abs(np.fft.fftshift(np.fft.fft(slc_input, axis=0), axes=0)) ** 2, axis=1
+        np.abs(fftshift(fft(slc_input, axis=0, workers=-1), axes=0)) ** 2, axis=1
     )
     n_sub = block_subaperture.shape[0]
     sub_specs = np.array([
         np.mean(
-            np.abs(np.fft.fftshift(np.fft.fft(sub_input[j], axis=0), axes=0)) ** 2, axis=1
+            np.abs(fftshift(fft(sub_input[j], axis=0, workers=-1), axes=0)) ** 2, axis=1
         )
         for j in range(n_sub)
     ])
@@ -418,11 +419,11 @@ if __name__ == '__main__':
 
     sub = AzimuthSubaperture(meta)
 
-    # plot_subaperture_diagnostics(sub, block)
+    plot_subaperture_diagnostics(sub, block)
     
     folder_out = Path('/media/simon/Extreme SSD/fmnisar/')
-    sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
-    sub.process_rslc(path_nisar, folder_out /  'variable_doppler_centroid.h5', pols=['HH'])
+    # sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
+    # sub.process_rslc(path_nisar, folder_out /  'variable_doppler_centroid.h5', pols=['HH'])
     
     
     
