@@ -6,10 +6,12 @@ Created on Jun 2, 2026
 from dataclasses import dataclass
 from pathlib import Path
 from scipy.fft import next_fast_len
+import warnings
 import numpy as np
 import h5py
 
 from inspect_nisar import extract_rslc_params
+from slc_io import read_range_block, get_available_pols, copy_h5_structure
 
 
 @dataclass
@@ -147,6 +149,76 @@ class AzimuthSubaperture:
         spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width)
         return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, N_orig)
 
+    def process_rslc(
+        self,
+        rslc_path: Path,
+        output_h5: Path,
+        freq: str = 'A',
+        pols: list = None,
+        blocksize_range: int = 512,
+    ) -> None:
+        """Process all polarizations of an RSLC image into subapertures and write to HDF5.
+
+        Uses the scene-mean Doppler centroid. Loops over range bins in blocks of
+        *blocksize_range*. Output layout mirrors the NISAR RSLC swath group with an
+        extra leading subaperture dimension; polarization datasets are complex64.
+
+        Parameters
+        ----------
+        rslc_path : Path
+            Path to the NISAR RSLC HDF5 file.
+        output_h5 : Path
+            Path for the output HDF5 file (created or overwritten).
+        freq : str
+            Frequency band, ``'A'`` or ``'B'``.
+        pols : list of str, optional
+            Polarizations to process. Defaults to all available in the file.
+        blocksize_range : int
+            Number of range bins processed per block.
+        """
+        warnings.warn(
+            "Output HDF5 metadata is copied verbatim from the NISAR RSLC source; "
+            "product-level metadata (e.g. product type, bandwidth, frequency label) "
+            "is not updated and needs to be reviewed and fixed.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+        rslc_path = Path(rslc_path)
+        mean_dc = float(np.mean(self.meta.doppler_centroid))
+
+        with h5py.File(rslc_path, 'r') as src:
+            if pols is None:
+                pols = get_available_pols(src, freq)
+
+            swath_grp = src[f'science/LSAR/RSLC/swaths/frequency{freq}']
+            n_az, n_rg = swath_grp[pols[0]].shape
+            skip_paths = {swath_grp[pol].name for pol in pols}
+
+            with h5py.File(output_h5, 'w') as dst:
+                copy_h5_structure(src['/'], dst['/'], skip=skip_paths)
+
+                out_swath = dst[f'science/LSAR/RSLC/swaths/frequency{freq}']
+                for pol in pols:
+                    ds = out_swath.create_dataset(
+                        pol,
+                        shape=(self.n_subapertures, n_az, n_rg),
+                        dtype=np.complex64,
+                        chunks=(1, min(256, n_az), min(blocksize_range, n_rg)),
+                    )
+                    ds.attrs['description'] = (
+                        f'Subaperture SLC for polarization {pol}; '
+                        f'dim 0 = subaperture index (0..{self.n_subapertures - 1})'
+                    )
+
+                for rg_start in range(0, n_rg, blocksize_range):
+                    rg_stop = min(rg_start + blocksize_range, n_rg)
+                    for pol in pols:
+                        block = read_range_block(rslc_path, rg_start, rg_stop, freq=freq, pol=pol)
+                        sub_block = self._process_block(block, dc=mean_dc)
+                        # sub_block: (n_subapertures, n_az, rg_stop - rg_start), complex64
+                        out_swath[pol][:, :, rg_start:rg_stop] = sub_block
+
 
 def raised_cosine_window(n, bin_centroid, bin_width, beta=0.5):
     # bin indices are after fftshift, from 0 to n-1
@@ -270,6 +342,7 @@ def plot_subaperture_diagnostics(
     plt.show()
 
 
+
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
 
@@ -277,11 +350,13 @@ if __name__ == '__main__':
     path_nisar = p0 / 'NISAR_L1_PR_RSLC_010_073_D_053_4005_DHDH_A_20260114T062318_20260114T062355_X05010_N_F_J_001.h5'
 
     meta = SubapertureMetaData.load_from_rslc_path(path_nisar)
-    print(meta.azimuth_bandwidth)
     block = np.load(p0 / 'block.npy')
 
     sub = AzimuthSubaperture(meta)
 
-    plot_subaperture_diagnostics(sub, block)
-
-
+    # plot_subaperture_diagnostics(sub, block)
+    
+    path_out = p0 / 'subaperture' / 'uniform_doppler_centroid.h5'
+    sub.process_rslc(path_nisar, path_out, pols=['HH'])
+    
+    
