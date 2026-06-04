@@ -432,7 +432,7 @@ class AzimuthSubaperture:
         def dc_for_block(az_start, az_stop, rg_start, rg_stop):
             az_center = self.meta.az_time[(az_start + az_stop) // 2]
             rg_center = self.meta.slant_range[(rg_start + rg_stop) // 2]
-            return float(rgi([[az_center, rg_center]]))
+            return float(rgi([[az_center, rg_center]])[0])
 
         self._run_blocks(rslc_path, output_h5, freq, pols, blocksize_range,
                          blocksize_az=blocksize_az, dc_for_block=dc_for_block)
@@ -598,7 +598,7 @@ if __name__ == '__main__':
 
     sub = AzimuthSubaperture(meta)
 
-    plot_subaperture_diagnostics(sub, block)
+    # plot_subaperture_diagnostics(sub, block)
 
     folder_out = Path('/media/simon/Extreme SSD/fmnisar/')
     # sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
