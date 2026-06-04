@@ -601,5 +601,5 @@ if __name__ == '__main__':
     # plot_subaperture_diagnostics(sub, block)
 
     folder_out = Path('/media/simon/Extreme SSD/fmnisar/')
-    # sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
+    sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
     sub.process_rslc(path_nisar, folder_out /  'variable_doppler_centroid.h5', pols=['HH'])
