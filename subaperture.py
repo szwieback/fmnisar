@@ -35,6 +35,11 @@ class SubapertureMetaData:
             Open handle to the NISAR RSLC HDF5 file.
         freq : {'A', 'B'}
             Frequency band to extract.
+
+        Returns
+        -------
+        meta : SubapertureMetaData
+            Subaperture metadata object.
         """
         base_proc = f'science/LSAR/RSLC/metadata/processingInformation/parameters/frequency{freq}'
         base_swath = f'science/LSAR/RSLC/swaths/frequency{freq}'
@@ -60,6 +65,11 @@ class SubapertureMetaData:
             Path to the NISAR RSLC HDF5 file.
         freq : {'A', 'B'}
             Frequency band to extract.
+
+        Returns
+        -------
+        meta : SubapertureMetaData
+            Subaperture metadata object.
         """
         with h5py.File(path, 'r') as fh:
             return cls.load_from_rslc(fh, freq=freq)
@@ -68,11 +78,10 @@ class SubapertureMetaData:
 class AzimuthSubaperture:
     """Subaperture decomposition of an RSLC azimuth spectrum.
 
-    Works on level-1 SLC data. Currently assumes a spatially uniform doppler centroid. 
-    Subapertures can optionally be demodulated to baseband. At the end, the doppler centroid modulation
-    of the full-azimuth-bandwitdth image is not re-applied by default.
-    
-    # To do: multicore, metadata, resample
+    Splits the processed azimuth bandwidth into overlapping sub-apertures by
+    applying raised-cosine bandpass windows in the Doppler frequency domain.
+    The Doppler centroid is removed before FFT and optionally reapplied after
+    IFFT. Works on NISAR level-1 RSLC data.
     """
 
     def __init__(
@@ -83,9 +92,29 @@ class AzimuthSubaperture:
         shrink_fraction_useful: float = 0.02,
         raised_cosine_beta: float = 0.5,
         demodulate_subaperture: bool = False,
-        remodulate_to_full_dc: bool = True
-        
+        remodulate_to_full_dc: bool = True,
     ):
+        """Initialize AzimuthSubaperture with RSLC metadata.
+
+        Parameters
+        ----------
+        meta : SubapertureMetaData
+            Azimuth metadata for the RSLC product.
+        n_subapertures : int
+            Number of sub-apertures to form.
+        overlap : float
+            Fractional overlap between adjacent sub-apertures (0 to 1).
+        shrink_fraction_useful : float
+            Fraction by which the usable bandwidth is shrunk at each end to
+            avoid spectral edge artefacts.
+        raised_cosine_beta : float
+            Roll-off parameter for the raised-cosine window (0 to 1).
+        demodulate_subaperture : bool
+            If True, shift each sub-aperture to baseband after IFFT.
+        remodulate_to_full_dc : bool
+            If True, reapply the Doppler centroid modulation that was removed
+            before FFT.
+        """
         self.meta = meta
         self.n_subapertures = n_subapertures
         self.overlap = overlap
@@ -95,23 +124,89 @@ class AzimuthSubaperture:
         self.remodulate_to_full_dc = remodulate_to_full_dc
 
     def _zero_pad(self, block):
+        """Zero-pad a block along azimuth to the next fast FFT length.
+
+        Parameters
+        ----------
+        block : numpy.ndarray
+            2-D SLC block of shape (n_az, n_rg).
+
+        Returns
+        -------
+        block_zp : numpy.ndarray
+            Zero-padded block of shape (N, n_rg) where N >= n_az.
+        """
         N = next_fast_len(block.shape[0])
         block_zp = np.zeros((N, block.shape[1]), dtype=np.complex64)
         block_zp[:block.shape[0], :] = block
         return block_zp
 
-    def _demodulate(self, block_zp, dc, zdts, az_time_start=0.0):
+    def _demodulate_slc(self, block_zp, doppler_centroid, zero_doppler_time_spacing,
+                        az_time_start=0.0):
+        """Remove Doppler centroid modulation from an SLC block.
+
+        Multiplies each azimuth line by exp(-2j*pi*doppler_centroid*t) so that
+        the spectrum is centered at DC before FFT.
+
+        Parameters
+        ----------
+        block_zp : numpy.ndarray
+            2-D SLC block (possibly zero-padded) of shape (N, n_rg).
+        doppler_centroid : float
+            Doppler centroid frequency [Hz].
+        zero_doppler_time_spacing : float
+            Azimuth sample spacing (1/PRF) [s].
+        az_time_start : float
+            Zero-Doppler time of the first azimuth line in the block [s].
+
+        Returns
+        -------
+        block_demodulated : numpy.ndarray
+            Demodulated SLC block of shape (N, n_rg).
+        modulation : numpy.ndarray
+            Complex modulation vector of shape (N,) used for remodulation.
+        """
         N = block_zp.shape[0]
-        az_time = az_time_start + np.arange(N) * zdts
-        modulation = np.exp(2j * np.pi * dc * az_time)
+        az_time = az_time_start + np.arange(N) * zero_doppler_time_spacing
+        modulation = np.exp(2j * np.pi * doppler_centroid * az_time)
         return block_zp * modulation.conj()[:, np.newaxis], modulation
 
     def _compute_spectrum(self, block_zp):
+        """Compute the shifted azimuth DFT spectrum of a zero-padded SLC block.
+
+        Parameters
+        ----------
+        block_zp : numpy.ndarray
+            Zero-padded SLC block of shape (N, n_rg).
+
+        Returns
+        -------
+        spectrum : numpy.ndarray
+            Azimuth spectrum of shape (N, n_rg), shifted so DC is at index N//2.
+        """
         # TODO: implement antenna pattern de-windowing
         return fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
 
-    def _compute_subaperture_params(self, N, az_bw, zdts):
-        fraction_useful = az_bw * zdts * (1 - self.shrink_fraction_useful)
+    def _compute_subaperture_params(self, N, azimuth_bandwidth, zero_doppler_time_spacing):
+        """Compute DFT bin width and centroid positions for all sub-apertures.
+
+        Parameters
+        ----------
+        N : int
+            FFT length (azimuth).
+        azimuth_bandwidth : float
+            Processed azimuth bandwidth [Hz].
+        zero_doppler_time_spacing : float
+            Azimuth sample spacing (1/PRF) [s].
+
+        Returns
+        -------
+        bin_width : int
+            Width of each sub-aperture window in DFT bins.
+        bin_centroids : numpy.ndarray
+            Centre DFT bin of each sub-aperture, shape (n_subapertures,).
+        """
+        fraction_useful = azimuth_bandwidth * zero_doppler_time_spacing * (1 - self.shrink_fraction_useful)
         bin_useful_lo = int(N * (1 - fraction_useful) // 2)
         bin_useful_hi = int(N * (1 + fraction_useful) // 2)
         bin_useful_width = bin_useful_hi - bin_useful_lo
@@ -123,6 +218,22 @@ class AzimuthSubaperture:
         return bin_width, bin_centroids
 
     def _apply_subaperture_windows(self, spectrum, bin_centroids, bin_width):
+        """Apply raised-cosine bandpass windows to extract each sub-aperture spectrum.
+
+        Parameters
+        ----------
+        spectrum : numpy.ndarray
+            Shifted azimuth spectrum of shape (N, n_rg).
+        bin_centroids : numpy.ndarray
+            Centre DFT bin of each sub-aperture, shape (n_subapertures,).
+        bin_width : int
+            Width of each sub-aperture window in DFT bins.
+
+        Returns
+        -------
+        spectrum_sub : numpy.ndarray
+            Windowed spectra of shape (n_subapertures, N, n_rg).
+        """
         spectrum_sub = np.zeros((self.n_subapertures,) + spectrum.shape, dtype=np.complex64)
         for j, centroid in enumerate(bin_centroids):
             win = construct_raised_cosine(spectrum.shape[0], centroid, bin_width, beta=self.raised_cosine_beta)
@@ -130,6 +241,24 @@ class AzimuthSubaperture:
         return spectrum_sub
 
     def _invert_subapertures(self, spectrum_sub, bin_centroids, modulation, N_orig):
+        """Apply inverse FFT to sub-aperture spectra and optionally remodulate.
+
+        Parameters
+        ----------
+        spectrum_sub : numpy.ndarray
+            Windowed spectra of shape (n_subapertures, N, n_rg).
+        bin_centroids : numpy.ndarray
+            Centre DFT bin of each sub-aperture, shape (n_subapertures,).
+        modulation : numpy.ndarray
+            Complex Doppler centroid modulation vector of shape (N,).
+        N_orig : int
+            Original (un-padded) number of azimuth lines.
+
+        Returns
+        -------
+        block_sub : numpy.ndarray
+            Sub-aperture SLC blocks of shape (n_subapertures, N_orig, n_rg).
+        """
         N = spectrum_sub.shape[1]
         block_sub = ifft(ifftshift(spectrum_sub, axes=1), axis=1, workers=-1)
         if self.demodulate_subaperture:
@@ -140,19 +269,42 @@ class AzimuthSubaperture:
             block_sub *= modulation[np.newaxis, :, np.newaxis]
         return block_sub[:, :N_orig, :]
 
-    def _process_block(self, block, dc=None, zdts=None, az_bw=None, az_time_start=0.0):
-        if dc is None:
-            dc = float(np.mean(self.meta.doppler_centroid))
-        if zdts is None:
-            zdts = self.meta.zero_doppler_time_spacing
-        if az_bw is None:
-            az_bw = self.meta.azimuth_bandwidth
+    def _process_block(self, block, doppler_centroid=None, zero_doppler_time_spacing=None,
+                       azimuth_bandwidth=None, az_time_start=0.0):
+        """Form sub-apertures from a single SLC block.
+
+        Parameters
+        ----------
+        block : numpy.ndarray
+            2-D SLC block of shape (n_az, n_rg).
+        doppler_centroid : float, optional
+            Doppler centroid [Hz]. Defaults to scene mean from metadata.
+        zero_doppler_time_spacing : float, optional
+            Azimuth sample spacing [s]. Defaults to value in metadata.
+        azimuth_bandwidth : float, optional
+            Processed azimuth bandwidth [Hz]. Defaults to value in metadata.
+        az_time_start : float
+            Zero-Doppler time of the first line in the block [s].
+
+        Returns
+        -------
+        block_sub : numpy.ndarray
+            Sub-aperture SLC blocks of shape (n_subapertures, n_az, n_rg).
+        """
+        if doppler_centroid is None:
+            doppler_centroid = float(np.mean(self.meta.doppler_centroid))
+        if zero_doppler_time_spacing is None:
+            zero_doppler_time_spacing = self.meta.zero_doppler_time_spacing
+        if azimuth_bandwidth is None:
+            azimuth_bandwidth = self.meta.azimuth_bandwidth
 
         N_orig = block.shape[0]
         block_zp = self._zero_pad(block)
-        block_zp, modulation = self._demodulate(block_zp, dc, zdts, az_time_start=az_time_start)
+        block_zp, modulation = self._demodulate_slc(
+            block_zp, doppler_centroid, zero_doppler_time_spacing, az_time_start=az_time_start)
         spectrum = self._compute_spectrum(block_zp)
-        bin_width, bin_centroids = self._compute_subaperture_params(block_zp.shape[0], az_bw, zdts)
+        bin_width, bin_centroids = self._compute_subaperture_params(
+            block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
         spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width)
         return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, N_orig)
 
@@ -209,12 +361,13 @@ class AzimuthSubaperture:
                 out_swath = self._setup_output_h5(src, dst, freq, pols, n_az, n_rg, blocksize_range)
                 for az_start, az_stop, rg_start, rg_stop in \
                         self._iter_blocks(n_az, n_rg, blocksize_az, blocksize_range):
-                    dc = dc_for_block(az_start, az_stop, rg_start, rg_stop)
+                    doppler_centroid = dc_for_block(az_start, az_stop, rg_start, rg_stop)
                     az_time_start = float(self.meta.az_time[az_start])
                     for pol in pols:
                         block = read_block(rslc_path, az_start, az_stop, rg_start, rg_stop,
                                            freq=freq, pol=pol)
-                        sub_block = self._process_block(block, dc=dc, az_time_start=az_time_start)
+                        sub_block = self._process_block(
+                            block, doppler_centroid=doppler_centroid, az_time_start=az_time_start)
                         out_swath[pol][:, az_start:az_stop, rg_start:rg_stop] = sub_block
 
     def process_rslc_uniform_dc(
@@ -230,18 +383,19 @@ class AzimuthSubaperture:
         Parameters
         ----------
         rslc_path : Path
+            Path to the input NISAR RSLC HDF5 file.
         output_h5 : Path
-            Output HDF5 (created or overwritten).
-        freq : str
-            Frequency band, ``'A'`` or ``'B'``.
+            Output HDF5 path (created or overwritten).
+        freq : {'A', 'B'}
+            Frequency band to process.
         pols : list of str, optional
             Polarizations to process. Defaults to all available.
         blocksize_range : int
-            Range bins per block.
+            Number of range bins per processing block.
         """
-        mean_dc = float(np.mean(self.meta.doppler_centroid))
+        mean_doppler_centroid = float(np.mean(self.meta.doppler_centroid))
         self._run_blocks(rslc_path, output_h5, freq, pols, blocksize_range,
-                         blocksize_az=None, dc_for_block=lambda *_: mean_dc)
+                         blocksize_az=None, dc_for_block=lambda *_: mean_doppler_centroid)
 
     def process_rslc(
         self,
@@ -254,23 +408,24 @@ class AzimuthSubaperture:
     ) -> None:
         """Process an RSLC into subapertures with per-block interpolated Doppler centroid.
 
-        Interpolates the Doppler centroid to each block center using bilinear
-        interpolation on the coarse DC grid. ``blocksize_az=None`` processes the full
-        azimuth extent as a single block.
+        Interpolates the Doppler centroid to each block centre using bilinear
+        interpolation on the coarse DC grid.
 
         Parameters
         ----------
         rslc_path : Path
+            Path to the input NISAR RSLC HDF5 file.
         output_h5 : Path
-            Output HDF5 (created or overwritten).
-        freq : str
-            Frequency band, ``'A'`` or ``'B'``.
+            Output HDF5 path (created or overwritten).
+        freq : {'A', 'B'}
+            Frequency band to process.
         pols : list of str, optional
             Polarizations to process. Defaults to all available.
         blocksize_range : int
-            Range bins per block.
+            Number of range bins per processing block.
         blocksize_az : int or None
-            Azimuth lines per block. ``None`` uses the full azimuth extent as one block.
+            Number of azimuth lines per processing block. ``None`` processes the
+            full azimuth extent as a single block.
         """
         rgi = self._build_dc_interpolator()
 
@@ -285,7 +440,28 @@ class AzimuthSubaperture:
 
 # TODO: shares Tukey/raised-cosine kernel with ISCE3 range split-spectrum; candidate for a shared window utility
 def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
-    # bin indices are after fftshift, from 0 to n-1
+    """Construct a raised-cosine bandpass window in DFT bin space.
+
+    Builds a 1-D window of length ``n`` that is unity in the flat passband,
+    tapers with a raised cosine in the transition regions, and zero outside.
+    Bin indices are assumed to be in fftshift order (DC at index n//2).
+
+    Parameters
+    ----------
+    n : int
+        Total number of DFT bins (FFT length).
+    bin_centroid : int
+        Centre bin of the passband (fftshift order).
+    bin_width : int
+        Full width of the passband in bins, including roll-off.
+    beta : float
+        Roll-off fraction (0 = rectangular, 1 = full cosine taper).
+
+    Returns
+    -------
+    rc : numpy.ndarray
+        Real-valued window array of length ``n``.
+    """
     rc = np.zeros(n, dtype=np.float32)
     bin_rolloff_hwidth = int((beta * bin_width) // 2)
 
@@ -312,42 +488,46 @@ def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
 def plot_subaperture_diagnostics(
     sub: AzimuthSubaperture,
     block: np.ndarray,
-    dc: float = None,
-    zdts: float = None,
-    az_bw: float = None,
+    doppler_centroid: float = None,
+    zero_doppler_time_spacing: float = None,
+    azimuth_bandwidth: float = None,
     demodulate: bool = True,
 ):
     import matplotlib.pyplot as plt
 
-    if dc is None:
-        dc = float(np.mean(sub.meta.doppler_centroid))
-    if zdts is None:
-        zdts = sub.meta.zero_doppler_time_spacing
-    if az_bw is None:
-        az_bw = sub.meta.azimuth_bandwidth
+    if doppler_centroid is None:
+        doppler_centroid = float(np.mean(sub.meta.doppler_centroid))
+    if zero_doppler_time_spacing is None:
+        zero_doppler_time_spacing = sub.meta.zero_doppler_time_spacing
+    if azimuth_bandwidth is None:
+        azimuth_bandwidth = sub.meta.azimuth_bandwidth
 
-    block_subaperture = sub._process_block(block, dc=dc, zdts=zdts, az_bw=az_bw)
+    block_subaperture = sub._process_block(
+        block, doppler_centroid=doppler_centroid,
+        zero_doppler_time_spacing=zero_doppler_time_spacing,
+        azimuth_bandwidth=azimuth_bandwidth)
 
     # DFT-domain: zero-pad, demodulate, compute spectrum and window params
     block_zp = sub._zero_pad(block)
-    block_zp_dm, _ = sub._demodulate(block_zp, dc, zdts)
+    block_zp_dm, _ = sub._demodulate_slc(block_zp, doppler_centroid, zero_doppler_time_spacing)
     spectrum = sub._compute_spectrum(block_zp_dm)
 
     N = block_zp.shape[0]
-    bin_width, bin_centroids = sub._compute_subaperture_params(N, az_bw, zdts)
-    fraction_useful = az_bw * zdts * (1 - sub.shrink_fraction_useful)
+    bin_width, bin_centroids = sub._compute_subaperture_params(
+        N, azimuth_bandwidth, zero_doppler_time_spacing)
+    fraction_useful = azimuth_bandwidth * zero_doppler_time_spacing * (1 - sub.shrink_fraction_useful)
     bin_useful_lo = int(N * (1 - fraction_useful) // 2)
     bin_useful_hi = int(N * (1 + fraction_useful) // 2)
 
     # Frequency-domain: power spectra of SLC and each subaperture
     N_slc = block.shape[0]
     N_sub = block_subaperture.shape[1]
-    freqs_slc = fftshift(fftfreq(N_slc, d=zdts))
-    freqs_sub = fftshift(fftfreq(N_sub, d=zdts))
+    freqs_slc = fftshift(fftfreq(N_slc, d=zero_doppler_time_spacing))
+    freqs_sub = fftshift(fftfreq(N_sub, d=zero_doppler_time_spacing))
 
     if demodulate:
-        mod_slc = np.exp(-2j * np.pi * dc * np.arange(N_slc) * zdts)
-        mod_sub = np.exp(-2j * np.pi * dc * np.arange(N_sub) * zdts)
+        mod_slc = np.exp(-2j * np.pi * doppler_centroid * np.arange(N_slc) * zero_doppler_time_spacing)
+        mod_sub = np.exp(-2j * np.pi * doppler_centroid * np.arange(N_sub) * zero_doppler_time_spacing)
         slc_input = block * mod_slc[:, np.newaxis]
         sub_input = block_subaperture * mod_sub[np.newaxis, :, np.newaxis]
     else:
@@ -406,7 +586,6 @@ def plot_subaperture_diagnostics(
     plt.show()
 
 
-
 if __name__ == '__main__':
     import matplotlib.pyplot as plt
 
@@ -414,16 +593,13 @@ if __name__ == '__main__':
     path_nisar = p0 / 'NISAR_L1_PR_RSLC_010_073_D_053_4005_DHDH_A_20260114T062318_20260114T062355_X05010_N_F_J_001.h5'
 
     meta = SubapertureMetaData.load_from_rslc_path(path_nisar)
-    dc = meta.doppler_centroid
+    doppler_centroid = meta.doppler_centroid
     block = np.load(p0 / 'block.npy')
 
     sub = AzimuthSubaperture(meta)
 
     plot_subaperture_diagnostics(sub, block)
-    
+
     folder_out = Path('/media/simon/Extreme SSD/fmnisar/')
     # sub.process_rslc_uniform_dc(path_nisar, folder_out /  'uniform_doppler_centroid.h5', pols=['HH'])
-    # sub.process_rslc(path_nisar, folder_out /  'variable_doppler_centroid.h5', pols=['HH'])
-    
-    
-    
+    sub.process_rslc(path_nisar, folder_out /  'variable_doppler_centroid.h5', pols=['HH'])
