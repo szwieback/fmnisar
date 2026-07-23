@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from scipy.fft import fft, ifft, fftshift, ifftshift, fftfreq, next_fast_len
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import uniform_filter1d
 import warnings
 import numpy as np
 import h5py
@@ -51,10 +52,7 @@ class AzimuthSubaperture:
 
     Splits the processed azimuth bandwidth into overlapping sub-apertures by
     applying raised-cosine bandpass windows in the Doppler frequency domain.
-    The Doppler centroid is removed before FFT so sub-aperture windows are
-    placed symmetrically about the true Doppler centroid; by default each
-    sub-aperture is then also shifted to its own baseband (0 Hz) after IFFT,
-    so no residual carrier remains. Works on NISAR level-1 RSLC data.
+    By default each sub-aperture's spectrum is centered.
     """
 
     def __init__(
@@ -64,23 +62,25 @@ class AzimuthSubaperture:
         overlap: float = 0.3,
         shrink_fraction_useful: float = 0.02,
         raised_cosine_beta: float = 0.5,
+        normalize_window_gain: bool = True,
         demodulate_subaperture: bool = True,
         remodulate_to_full_dc: bool = False,
+        deweight_spectrum: bool = False,
+        deweight_smooth_bins: int = None,
     ):
-        """Initialize AzimuthSubaperture with RSLC metadata.
-
-        With the defaults (``demodulate_subaperture=True``,
-        ``remodulate_to_full_dc=False``), each sub-aperture ends up centered
-        at 0 Hz. Setting ``remodulate_to_full_dc=True`` instead reapplies the
-        scene Doppler centroid so sub-apertures are centered on it.
-        """
+        """If deweight_spectrum is set, the profile is estimated from each block's own
+        range-averaged power spectrum unless estimate_deweighting_profile was already called."""
         self.meta = meta
         self.n_subapertures = n_subapertures
         self.overlap = overlap
         self.shrink_fraction_useful = shrink_fraction_useful
         self.raised_cosine_beta = raised_cosine_beta
+        self.normalize_window_gain = normalize_window_gain
         self.demodulate_subaperture = demodulate_subaperture
         self.remodulate_to_full_dc = remodulate_to_full_dc
+        self.deweight_spectrum = deweight_spectrum
+        self.deweight_smooth_bins = deweight_smooth_bins
+        self._deweight_profile = None
 
     def _zero_pad(self, block):
         """Zero-pad a 2-D SLC block (n_az, n_rg) along azimuth to the next fast FFT length."""
@@ -91,24 +91,27 @@ class AzimuthSubaperture:
 
     def _demodulate_slc(self, block_zp, doppler_centroid, zero_doppler_time_spacing,
                         az_time_start=0.0):
-        """Remove Doppler centroid modulation from an SLC block.
-
-        Multiplies each azimuth line by exp(-2j*pi*doppler_centroid*t) so that
-        the spectrum is centered at DC before FFT. Returns the demodulated
-        block and the complex modulation vector (for later remodulation).
-        """
+        """Centers spectrum using provided doppler_centroid"""
         n = block_zp.shape[0]
         az_time = az_time_start + np.arange(n) * zero_doppler_time_spacing
         modulation = np.exp(2j * np.pi * doppler_centroid * az_time)
         return block_zp * modulation.conj()[:, np.newaxis], modulation
 
-    def _compute_spectrum(self, block_zp):
-        """Compute the shifted azimuth DFT spectrum (DC at index n//2) of a zero-padded SLC block."""
-        # TODO: implement antenna pattern de-windowing
-        return fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
+    def _compute_spectrum(self, block_zp, bin_useful_lo=None, bin_useful_hi=None, bin_width=None):
+        """Compute the azimuth DFT spectrum (centered), applying de-weighting if enabled."""
+        spectrum = fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
+        if self.deweight_spectrum:
+            if self._deweight_profile is None:
+                avg_power = np.mean(np.abs(spectrum) ** 2, axis=1)
+                self._deweight_profile = self._build_deweight_profile(
+                    avg_power, bin_useful_lo, bin_useful_hi, bin_width)
+            if self._deweight_profile.shape[0] != spectrum.shape[0]:
+                raise ValueError("de-weighting profile length does not match padded azimuth length")
+            spectrum = spectrum * self._deweight_profile[:, np.newaxis]
+        return spectrum
 
     def _compute_subaperture_params(self, n, azimuth_bandwidth, zero_doppler_time_spacing):
-        """Compute DFT bin width and centroid positions for all sub-apertures."""
+        """Compute DFT bin width, centroid positions, and useful-band bin range for all sub-apertures."""
         fraction_useful = azimuth_bandwidth * zero_doppler_time_spacing * (1 - self.shrink_fraction_useful)
         bin_useful_lo = int(n * (1 - fraction_useful) // 2)
         bin_useful_hi = int(n * (1 + fraction_useful) // 2)
@@ -118,14 +121,76 @@ class AzimuthSubaperture:
             bin_useful_lo + bin_width // 2
             + np.arange(self.n_subapertures) * bin_width * (1 - self.overlap)
         ).astype(np.int64)
-        return bin_width, bin_centroids
+        return bin_width, bin_centroids, bin_useful_lo, bin_useful_hi
 
-    def _apply_subaperture_windows(self, spectrum, bin_centroids, bin_width):
-        """Apply raised-cosine bandpass windows, returning windowed spectra (n_subapertures, n, n_rg)."""
+    def _build_deweight_profile(self, avg_power, bin_useful_lo, bin_useful_hi, bin_width, eps=1e-6):
+        """Smoothed inverse-sqrt correction from avg_power (~taper**2) within the useful band; 1 elsewhere."""
+        smooth_bins = self.deweight_smooth_bins or max(bin_width // 16, 1)
+        segment = avg_power[bin_useful_lo:bin_useful_hi]
+        smoothed = uniform_filter1d(segment, size=smooth_bins, mode='nearest')
+        smoothed = np.maximum(smoothed, eps * float(np.max(smoothed)))
+        shape = smoothed / float(np.mean(smoothed))
+        profile = np.ones(avg_power.shape[0], dtype=np.float32)
+        profile[bin_useful_lo:bin_useful_hi] = 1.0 / np.sqrt(shape)
+        return profile
+
+    def estimate_deweighting_profile(self, rslc_path, az_start=0, az_stop=None, freq='A', pol=None,
+                                     blocksize_range=512, dc_for_block=None):
+        """Estimate and store self._deweight_profile from the range-averaged azimuth power spectrum. """
+        rslc_path = Path(rslc_path)
+        if dc_for_block is None:
+            mean_dc = float(np.mean(self.meta.doppler_centroid))
+            dc_for_block = lambda *_: mean_dc
+        with h5py.File(rslc_path, 'r') as fh:
+            if pol is None:
+                pol = get_available_pols(fh, freq)[0]
+            n_az, n_rg = fh[f'science/LSAR/RSLC/swaths/frequency{freq}/{pol}'].shape
+        if az_stop is None:
+            az_stop = n_az
+
+        n_az_padded = next_fast_len(az_stop - az_start)
+        power_sum = np.zeros(n_az_padded)
+        n_rg_total = 0
+        for rg_start in range(0, n_rg, blocksize_range):
+            rg_stop = min(rg_start + blocksize_range, n_rg)
+            doppler_centroid = dc_for_block(az_start, az_stop, rg_start, rg_stop)
+            block = read_block(rslc_path, az_start, az_stop, rg_start, rg_stop, freq=freq, pol=pol)
+            block_zp = self._zero_pad(block)
+            block_zp, _ = self._demodulate_slc(block_zp, doppler_centroid, self.meta.zero_doppler_time_spacing)
+            spectrum = fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
+            power_sum += np.sum(np.abs(spectrum) ** 2, axis=1)
+            n_rg_total += rg_stop - rg_start
+
+        avg_power = power_sum / n_rg_total
+        bin_width, _, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
+            n_az_padded, self.meta.azimuth_bandwidth, self.meta.zero_doppler_time_spacing)
+        self._deweight_profile = self._build_deweight_profile(
+            avg_power, bin_useful_lo, bin_useful_hi, bin_width)
+        return self._deweight_profile
+
+    def _window_gain_scale(self, win, bin_useful_width, eps=1e-12):
+        """Scale factor so subaperture power matches full-aperture power for distributed target."""
+        win_energy = float(np.sum(win.astype(np.float64) ** 2))
+        if win_energy < eps:
+            warnings.warn(
+                "Sub-aperture window has ~zero passband energy; skipping gain "
+                "normalization for this window.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return 1.0
+        return np.sqrt(bin_useful_width / win_energy)
+
+    def _apply_subaperture_windows(self, spectrum, bin_centroids, bin_width, bin_useful_width):
+        """Apply raised-cosine bandpass windows, returning windowed spectra (n_subapertures, n, n_rg). """
         spectrum_sub = np.zeros((self.n_subapertures,) + spectrum.shape, dtype=np.complex64)
         for j, centroid in enumerate(bin_centroids):
-            win = construct_raised_cosine(spectrum.shape[0], centroid, bin_width, beta=self.raised_cosine_beta)
+            win = construct_raised_cosine(
+                spectrum.shape[0], centroid, bin_width, beta=self.raised_cosine_beta)
             spectrum_sub[j] = spectrum * win[:, np.newaxis]
+            if self.normalize_window_gain:
+                scale = self._window_gain_scale(win, bin_useful_width)
+                spectrum_sub[j] *= np.float32(scale)
         return spectrum_sub
 
     def _invert_subapertures(self, spectrum_sub, bin_centroids, modulation, n_orig):
@@ -162,10 +227,11 @@ class AzimuthSubaperture:
         block_zp = self._zero_pad(block)
         block_zp, modulation = self._demodulate_slc(
             block_zp, doppler_centroid, zero_doppler_time_spacing, az_time_start=az_time_start)
-        spectrum = self._compute_spectrum(block_zp)
-        bin_width, bin_centroids = self._compute_subaperture_params(
+        bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
             block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
-        spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width)
+        spectrum = self._compute_spectrum(block_zp, bin_useful_lo, bin_useful_hi, bin_width)
+        bin_useful_width = bin_useful_hi - bin_useful_lo
+        spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width, bin_useful_width)
         return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, n_orig)
 
     def _build_dc_interpolator(self) -> RegularGridInterpolator:
@@ -219,8 +285,14 @@ class AzimuthSubaperture:
             n_az, n_rg = src[f'science/LSAR/RSLC/swaths/frequency{freq}/{pols[0]}'].shape
             with h5py.File(output_h5, 'w') as dst:
                 out_swath = self._setup_output_h5(src, dst, freq, pols, n_az, n_rg, blocksize_range)
+                az_start_prev = None
                 for az_start, az_stop, rg_start, rg_stop in \
                         self._iter_blocks(n_az, n_rg, blocksize_az, blocksize_range):
+                    if self.deweight_spectrum and az_start != az_start_prev:
+                        self.estimate_deweighting_profile(
+                            rslc_path, az_start=az_start, az_stop=az_stop, freq=freq, pol=pols[0],
+                            blocksize_range=blocksize_range, dc_for_block=dc_for_block)
+                        az_start_prev = az_start
                     doppler_centroid = dc_for_block(az_start, az_stop, rg_start, rg_stop)
                     az_time_start = float(self.meta.az_time[az_start])
                     for pol in pols:
@@ -274,7 +346,7 @@ class AzimuthSubaperture:
                          blocksize_az=blocksize_az, dc_for_block=dc_for_block)
 
 
-# TODO: shares Tukey/raised-cosine kernel with ISCE3 range split-spectrum; candidate for a shared window utility
+# TODO: shares Tukey/raised-cosine kernel with ISCE3 range split-spectrum
 def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
     """Construct a raised-cosine bandpass window of length n in DFT bin space.
 
@@ -331,14 +403,12 @@ def plot_subaperture_diagnostics(
     # DFT-domain: zero-pad, demodulate, compute spectrum and window params
     block_zp = sub._zero_pad(block)
     block_zp_dm, _ = sub._demodulate_slc(block_zp, doppler_centroid, zero_doppler_time_spacing)
-    spectrum = sub._compute_spectrum(block_zp_dm)
 
     n = block_zp.shape[0]
-    bin_width, bin_centroids = sub._compute_subaperture_params(
+    bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = sub._compute_subaperture_params(
         n, azimuth_bandwidth, zero_doppler_time_spacing)
-    fraction_useful = azimuth_bandwidth * zero_doppler_time_spacing * (1 - sub.shrink_fraction_useful)
-    bin_useful_lo = int(n * (1 - fraction_useful) // 2)
-    bin_useful_hi = int(n * (1 + fraction_useful) // 2)
+    bin_useful_width = bin_useful_hi - bin_useful_lo
+    spectrum = sub._compute_spectrum(block_zp_dm, bin_useful_lo, bin_useful_hi, bin_width)
 
     # Frequency-domain: power spectra of SLC and each subaperture
     n_az_slc = block.shape[0]
@@ -348,11 +418,16 @@ def plot_subaperture_diagnostics(
 
     if demodulate:
         mod_slc = np.exp(-2j * np.pi * doppler_centroid * np.arange(n_az_slc) * zero_doppler_time_spacing)
-        mod_sub = np.exp(-2j * np.pi * doppler_centroid * np.arange(n_az_sub) * zero_doppler_time_spacing)
         slc_input = block * mod_slc[:, np.newaxis]
-        sub_input = block_subaperture * mod_sub[np.newaxis, :, np.newaxis]
     else:
         slc_input = block
+
+    if demodulate and not sub.demodulate_subaperture:
+        # block_subaperture still carries the scene Doppler centroid; remove it for display.
+        mod_sub = np.exp(-2j * np.pi * doppler_centroid * np.arange(n_az_sub) * zero_doppler_time_spacing)
+        sub_input = block_subaperture * mod_sub[np.newaxis, :, np.newaxis]
+    else:
+        # sub.demodulate_subaperture already shifted each sub-aperture to its own baseband.
         sub_input = block_subaperture
 
     slc_spec = np.mean(
@@ -394,11 +469,18 @@ def plot_subaperture_diagnostics(
     ax_win.set_ylabel('Power (dB)')
     ax_win2 = ax_win.twinx()
     bin_indices = np.arange(n)
+    max_weight = 1.0
     for centroid, color in zip(bin_centroids, colors):
         win = construct_raised_cosine(n, int(centroid), int(bin_width), beta=sub.raised_cosine_beta)
-        ax_win2.plot(bin_indices, win.real, color=color, alpha=0.7)
+        if sub.normalize_window_gain:
+            scale = sub._window_gain_scale(win, bin_useful_width)
+            win = win * scale
+        ax_win2.plot(bin_indices, win.real, color=color, alpha=0.8)
+        max_weight = max(max_weight, float(win.real.max()))
         ax_win.axvline(centroid, c='#aaaaaa', alpha=0.5, zorder=2)
-    ax_win2.set_ylim(0, 1.5)
+    if sub.deweight_spectrum and sub._deweight_profile is not None:
+        ax_win2.plot(bin_indices, sub._deweight_profile, c='k', ls='--', lw=1, alpha=0.6, label='de-weight profile')
+    ax_win2.set_ylim(0, 1.2 * max_weight)
     ax_win2.set_ylabel('Window weight')
     ax_win.set_xlabel('DFT index')
     ax_win.set_title('Spectrum and subaperture windows')
