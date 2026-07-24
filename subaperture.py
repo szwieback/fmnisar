@@ -111,17 +111,16 @@ class AzimuthSubaperture:
         return spectrum
 
     def _compute_subaperture_params(self, n, azimuth_bandwidth, zero_doppler_time_spacing):
-        """Compute DFT bin width, centroid positions, and useful-band bin range for all sub-apertures."""
+        """Compute DFT bin width, integer and fractional centroid positions, and useful-band bin range."""
         fraction_useful = azimuth_bandwidth * zero_doppler_time_spacing * (1 - self.shrink_fraction_useful)
         bin_useful_lo = int(n * (1 - fraction_useful) // 2)
         bin_useful_hi = int(n * (1 + fraction_useful) // 2)
         bin_useful_width = bin_useful_hi - bin_useful_lo
         bin_width = int(bin_useful_width // (1 + (self.n_subapertures - 1) * (1 - self.overlap)))
-        bin_centroids = (
-            bin_useful_lo + bin_width // 2
-            + np.arange(self.n_subapertures) * bin_width * (1 - self.overlap)
-        ).astype(np.int64)
-        return bin_width, bin_centroids, bin_useful_lo, bin_useful_hi
+        half_span = bin_width * (1 - self.overlap) * (self.n_subapertures - 1) / 2 # for both even and odd N
+        bin_centroids_frac = np.linspace(n // 2 - half_span, n // 2 + half_span, self.n_subapertures)
+        bin_centroids = np.round(bin_centroids_frac).astype(np.int64)
+        return bin_width, bin_centroids, bin_useful_lo, bin_useful_hi, bin_centroids_frac
 
     def _build_deweight_profile(self, avg_power, bin_useful_lo, bin_useful_hi, bin_width, eps=1e-6):
         """Smoothed inverse-sqrt correction from avg_power (~taper**2) within the useful band; 1 elsewhere."""
@@ -162,7 +161,7 @@ class AzimuthSubaperture:
             n_rg_total += rg_stop - rg_start
 
         avg_power = power_sum / n_rg_total
-        bin_width, _, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
+        bin_width, _, bin_useful_lo, bin_useful_hi, _ = self._compute_subaperture_params(
             n_az_padded, self.meta.azimuth_bandwidth, self.meta.zero_doppler_time_spacing)
         self._deweight_profile = self._build_deweight_profile(
             avg_power, bin_useful_lo, bin_useful_hi, bin_width)
@@ -193,16 +192,14 @@ class AzimuthSubaperture:
                 spectrum_sub[j] *= np.float32(scale)
         return spectrum_sub
 
-    def _invert_subapertures(self, spectrum_sub, bin_centroids, modulation, n_orig):
-        """Apply inverse FFT to sub-aperture spectra and optionally remodulate.
-
-        n_orig is the original (un-padded) number of azimuth lines, used to
-        crop the zero-padded result back down.
-        """
+    def _invert_subapertures(self, spectrum_sub, bin_centroids_frac, modulation, n_orig):
+        """Inverse-FFT sub-aperture spectra to baseband, crop to n_orig lines, optionally remodulate."""
         n = spectrum_sub.shape[1]
         block_sub = ifft(ifftshift(spectrum_sub, axes=1), axis=1, workers=-1)
         if self.demodulate_subaperture:
-            for j, centroid in enumerate(bin_centroids):
+            # fractional (un-rounded) centroids: near the mid-array peak an integer-rounded
+            # centroid carries ~pi/bin of residual phase, jittering the inter-look phase ramp
+            for j, centroid in enumerate(bin_centroids_frac):
                 sub_mod = np.exp(2j * np.pi * (centroid - n // 2) * np.arange(n) / n)
                 block_sub[j] *= sub_mod.conj()[:, np.newaxis]
         if self.remodulate_to_full_dc:
@@ -227,12 +224,13 @@ class AzimuthSubaperture:
         block_zp = self._zero_pad(block)
         block_zp, modulation = self._demodulate_slc(
             block_zp, doppler_centroid, zero_doppler_time_spacing, az_time_start=az_time_start)
-        bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
-            block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
+        bin_width, bin_centroids, bin_useful_lo, bin_useful_hi, bin_centroids_frac = \
+            self._compute_subaperture_params(
+                block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
         spectrum = self._compute_spectrum(block_zp, bin_useful_lo, bin_useful_hi, bin_width)
         bin_useful_width = bin_useful_hi - bin_useful_lo
         spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width, bin_useful_width)
-        return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, n_orig)
+        return self._invert_subapertures(spectrum_sub, bin_centroids_frac, modulation, n_orig)
 
     def _build_dc_interpolator(self) -> RegularGridInterpolator:
         return RegularGridInterpolator(
@@ -405,7 +403,7 @@ def plot_subaperture_diagnostics(
     block_zp_dm, _ = sub._demodulate_slc(block_zp, doppler_centroid, zero_doppler_time_spacing)
 
     n = block_zp.shape[0]
-    bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = sub._compute_subaperture_params(
+    bin_width, bin_centroids, bin_useful_lo, bin_useful_hi, _ = sub._compute_subaperture_params(
         n, azimuth_bandwidth, zero_doppler_time_spacing)
     bin_useful_width = bin_useful_hi - bin_useful_lo
     spectrum = sub._compute_spectrum(block_zp_dm, bin_useful_lo, bin_useful_hi, bin_width)
