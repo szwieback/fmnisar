@@ -49,17 +49,43 @@ def covariance_matrix(
 def multilook_intensity(slc_sub: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
     return _boxcar_multilook(np.abs(slc_sub) ** 2, looks)
 
-def diffphase_statistics(covariance_sub):
-    # actually inter-aperture phase mean/variance from normalized phasors
-    # check sarpy implementation [nonuniform aperture spacing]
-    cv_nn = np.diagonal(covariance_sub, offset=1, axis1=0, axis2=1) # nearest subaperture neighb. covariance
-    cross = cv_nn[..., :-1] * cv_nn[..., 1:].conj()
-    cross_phasor = cross / np.abs(cross)
-    mean_phasor = np.mean(cross_phasor, axis=-1)
+
+def entropy(covariance: np.ndarray) -> np.ndarray:
+    """Shannon entropy (nats) of the normalized covariance eigenvalue spectrum, per pixel."""
+    mat = np.moveaxis(covariance, (0, 1), (-2, -1))   # (n_az_ml, n_rg_ml, n_sub, n_sub)
+    eigvals = np.linalg.eigvalsh(mat)
+    eigvals = np.clip(eigvals, 0.0, None)
+    p = eigvals / eigvals.sum(axis=-1, keepdims=True)
+    return -np.sum(p * np.log(np.where(p > 0, p, 1.0)), axis=-1)  # (n_az_ml, n_rg_ml)
+
+def _diffphase_from_nn_covariance(cv_nn, sub_axis=-1):
+    """Inter-aperture phase mean/variance from nearest-neighbour covariances along sub_axis."""
+    # check sarpy implementation [nonuniform aperture spacing, not working on nearest neighb.]
+    phasor = cv_nn / np.abs(cv_nn)
+    mean_phasor = np.mean(phasor, axis=sub_axis)
     M = np.angle(mean_phasor)
     V = 1 - np.abs(mean_phasor)
     return M, V
+
+
+def diffphase_statistics(covariance_sub):
+    """Inter-aperture phase mean/variance from a multilooked sub-aperture covariance matrix."""
+    cv_nn = np.diagonal(covariance_sub, offset=1, axis1=0, axis2=1) # nearest subaperture neighb. covariance
+    return _diffphase_from_nn_covariance(cv_nn, sub_axis=-1)
+
+
+def diffphase_statistics_slc(slc_sub):
+    #full resolution; directly from slc_sub
+    cv_nn = slc_sub[:-1] * slc_sub[1:].conj() # nearest neighb. covariance, shape (n_sub-1, n_az, n_rg)
+    return _diffphase_from_nn_covariance(cv_nn, sub_axis=0)
     
+
+def normalized_variance(slc_sub: np.ndarray) -> np.ndarray:
+    #Variance of single-look log-intensity across sub-apertures
+    log_intensity = np.log(np.abs(slc_sub) ** 2)
+    # log_intensity is Gumbel with Var = pi^2/6 for Gaussian speckle
+    return log_intensity.var(axis=0, ddof=1)
+
 
 def intensity_to_rgb(
     intensity: np.ndarray, low_pct: float = 2.0, high_pct: float = 98.0, gamma: float = 1.0

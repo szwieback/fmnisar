@@ -11,7 +11,7 @@ from subaperture import AzimuthSubaperture, SubapertureMetaData, plot_subapertur
 from ioput import read_block, latlon_box_to_radar_bbox
 from products import (
     multilook_intensity, intensity_to_rgb, coherence, covariance_matrix,
-    diffphase_statistics)
+    diffphase_statistics, diffphase_statistics_slc, entropy, normalized_variance)
 
 path_nisar = Path(
     '/media/simon/Extreme SSD/fmnisar/Sydney/'
@@ -69,6 +69,11 @@ if __name__ == '__main__':
         rgb_sl = intensity_to_rgb(intensity_sl, gamma=gamma)
         plt.imsave(folder_out / f'{name}_subaperture_rgb_singlelook.png', rgb_sl)
 
+        # log-intensity variance across sub-apertures (pi^2/6 ~= 1.64 for Gaussian speckle)
+        nv = normalized_variance(block_sub)
+        plt.imsave(folder_out / f'{name}_subaperture_normvariance.png',
+                   nv, cmap='magma', vmin=0, vmax=5)
+
         # multilooked RGB composite
         intensity_ml = multilook_intensity(block_sub, (az_looks, rg_looks))
         rgb_ml = intensity_to_rgb(intensity_ml, gamma=gamma)
@@ -93,11 +98,23 @@ if __name__ == '__main__':
         np.save(folder_out / f'{name}_subaperture_covariance_matrix.npy', cov)
         np.save(folder_out / f'{name}_subaperture_coherence_matrix.npy', coh)
 
-        M, V = diffphase_statistics(covariance_matrix)
+        # entropy of the sub-aperture covariance spectrum, in [0, log(n_subapertures)]
+        H = entropy(cov)
+        plt.imsave(folder_out / f'{name}_subaperture_entropy.png',
+                   H, cmap='magma', vmin=0, vmax=np.log(n_subapertures))
+
+        M, V = diffphase_statistics(cov)
         plt.imsave(folder_out / f'{name}_subaperture_phasevariance.png',
                    V, cmap='gray', vmin=0, vmax=1)
         plt.imsave(folder_out / f'{name}_subaperture_phasemean.png',
                    M, cmap='twilight_shifted', vmin=-np.pi, vmax=np.pi)
+
+        # full-resolution phase mean/variance directly from the baseband subaperture SLC stack
+        M_full, V_full = diffphase_statistics_slc(block_sub_baseband)
+        plt.imsave(folder_out / f'{name}_subaperture_phasevariance_singlelook.png',
+                   V_full, cmap='gray', vmin=0, vmax=1)
+        plt.imsave(folder_out / f'{name}_subaperture_phasemean_singlelook.png',
+                   M_full, cmap='twilight_shifted', vmin=-np.pi, vmax=np.pi)
         
 
         # diagnostics: spectra and sub-aperture windows over the AOI block

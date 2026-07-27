@@ -14,8 +14,6 @@ The project uses a conda environment named `isce3` (as configured in `.pydevproj
 conda activate isce3
 ```
 
-ISCE3 is JPL's SAR processing framework. Key Python entry point: `import isce3`. Its GPU-accelerated routines (via CUDA) are available when running on a machine with a compatible GPU.
-
 ## Key Domain Concepts
 
 - **NISAR**: NASA-ISRO SAR Mission — L-band and S-band dual-frequency SAR satellite. Data products include RSLC (Range-compressed Single-Look Complex), GSLC, GCOV, GUNW, etc.
