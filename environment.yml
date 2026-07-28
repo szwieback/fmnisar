@@ -23,7 +23,10 @@ dependencies:
   - numpy<2
   - scipy>=1.11
   - h5py>=3.10
-  - matplotlib>=3.8
+  # matplotlib-base rather than matplotlib: everything here writes files through
+  # imsave/savefig, so the Qt/PySide6 GUI backend that the full package pulls in
+  # on Linux is dead weight in CI. The macosx and Agg backends still work.
+  - matplotlib-base>=3.8
 
   # SAR backend. Used in ioput.py for orbit loading (isce3.core.load_orbit_from_h5_group),
   # the WGS84 ellipsoid, and geo2rdr_bracket in latlon_box_to_radar_bbox.
