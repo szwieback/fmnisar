@@ -38,3 +38,7 @@ dependencies:
 
   # Interactive / notebook work.
   - ipython
+
+  # Test suite. tests/make_test_rslc.py synthesises a small RSLC from physical
+  # parameters, and tests/test_pipeline.py runs the repo against it.
+  - pytest>=8
