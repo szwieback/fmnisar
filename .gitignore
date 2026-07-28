@@ -10,7 +10,30 @@
 # Claude Code
 .claude/settings.local.json
 
+# macOS
+.DS_Store
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Project outputs. data/raw holds downloaded or streamed inputs, data/processed
+# holds anything a script wrote, figures/ holds plots. None of it belongs in git.
+data/
+figures/
+
+# Data formats, in case any land outside the directories above. NISAR products
+# and their intermediates are far too large to track.
+*.h5
+*.hdf5
+*.nc
+*.tif
+*.tiff
+*.vrt
+*.npy
+*.npz
+*.SAFE/
+*.zip
