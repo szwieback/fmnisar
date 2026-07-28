@@ -1,0 +1,40 @@
+# Conda environment for the fmnisar prototype pipeline.
+#
+#   conda env create -f environment.yml
+#   conda activate fmnisar
+#
+# Direct imports across the repo (ioput.py, subaperture.py, simulation.py,
+# products.py, scripts/) are only: numpy, scipy, h5py, matplotlib, isce3.
+# Everything else here is either a transitive dependency worth naming
+# explicitly or a convenience tool for interactive work.
+name: fmnisar
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  # isce3 0.25.x on conda-forge is built per-Python; 3.11 is what the existing
+  # isce3 env uses and what the current builds target.
+  - python=3.11
+
+  # Core numerics. numpy is held below 2 to match the working isce3 env; isce3
+  # itself declares numpy >=1.23,<3, so this can be relaxed if needed.
+  - numpy<2
+  - scipy>=1.11
+  - h5py>=3.10
+  - matplotlib>=3.8
+
+  # SAR backend. Used in ioput.py for orbit loading (isce3.core.load_orbit_from_h5_group),
+  # the WGS84 ellipsoid, and geo2rdr_bracket in latlon_box_to_radar_bbox.
+  # Pulls in gdal, shapely, pyproj, ruamel.yaml, pyre, pysolid, yamale, fftw.
+  - isce3>=0.25
+
+  # Named explicitly because they are used indirectly through isce3 and are
+  # useful to have pinned when debugging geolocation.
+  - gdal>=3.12
+  - pyproj>=3.7
+  - shapely>=2.1
+
+  # Interactive / notebook work.
+  - ipython
