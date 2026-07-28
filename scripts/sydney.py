@@ -69,7 +69,12 @@ if __name__ == '__main__':
         rgb_sl = intensity_to_rgb(intensity_sl, gamma=gamma)
         plt.imsave(folder_out / f'{name}_subaperture_rgb_singlelook.png', rgb_sl)
 
-        # log-intensity variance across sub-apertures (pi^2/6 ~= 1.64 for Gaussian speckle)
+        # single-look full-resolution full-aperture image (grayscale, same stretch/gamma)
+        intensity_full_sl = (abs(block) ** 2)[None].repeat(3, axis=0)
+        rgb_full_sl = intensity_to_rgb(intensity_full_sl, gamma=gamma)
+        plt.imsave(folder_out / f'{name}_fullaperture_singlelook.png', rgb_full_sl)
+
+        # log-intensity variance across sub-apertures
         nv = normalized_variance(block_sub)
         plt.imsave(folder_out / f'{name}_subaperture_normvariance.png',
                    nv, cmap='magma', vmin=0, vmax=5)
