@@ -1,0 +1,42 @@
+{
+  "environment": {
+    "h5py": "3.16.0",
+    "isce3": "0.25.8",
+    "numpy": "2.5.1",
+    "platform": "Darwin-arm64",
+    "python": "3.12.13",
+    "scipy": "1.17.1"
+  },
+  "values": {
+    "bbox": [
+      86,
+      171,
+      30,
+      99
+    ],
+    "look_power_ratios": [
+      0.9937529873318225,
+      0.9938727586253681,
+      0.9937394199243829
+    ],
+    "mean_adjacent_coherence": 0.3861667513847351,
+    "mean_amplitude": 0.8195173144340515,
+    "mean_diffphase_variance": 0.35354143381118774,
+    "mean_entropy": 0.8628937005996704,
+    "mean_intensity_hh": 1.071946382522583,
+    "mean_intensity_hv": 0.17056399583816528,
+    "mean_outer_coherence": 0.38620054721832275,
+    "point_target_diffphase_cosine": [
+      0.9968259334564209,
+      -0.999720573425293,
+      0.9975388646125793
+    ],
+    "point_target_intensity": [
+      541.774169921875,
+      233.22354125976562,
+      70.89521026611328
+    ],
+    "scene_center_lat": 37.10147064139617,
+    "scene_center_lon": -117.26758953891262
+  }
+}
