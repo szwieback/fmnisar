@@ -46,6 +46,13 @@ def covariance_matrix(
     return covariance, coherence
 
 
+def mean_coherence(coherence_matrix: np.ndarray) -> np.ndarray:
+    """Mean coherence across all N-choose-2 sub-aperture pairs, per pixel."""
+    n_sub = coherence_matrix.shape[0]
+    iu = np.triu_indices(n_sub, k=1)
+    return coherence_matrix[iu].mean(axis=0)
+
+
 def multilook_intensity(slc_sub: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
     return _boxcar_multilook(np.abs(slc_sub) ** 2, looks)
 

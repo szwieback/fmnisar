@@ -49,7 +49,7 @@ def plot_moving_target_phase(save_path: Path, slant_range: float, bandwidth: flo
 
     cases = [
         ('stationary target', dict(v_range=0.0, v_az=0.0), 'k', 'o'),
-        (f'radial velocity ($v_r$={v_range:.0f} m/s)', dict(v_range=v_range, v_az=0.0), 'C0', 's'),
+        (f'radial velocity ($v_r$={v_range*100:.0f} cm/s)', dict(v_range=v_range, v_az=0.0), 'C0', 's'),
         (f'azimuth velocity ($v_{{az}}$={v_az:.0f} m/s)', dict(v_range=0.0, v_az=v_az), 'C3', '^'),
     ]
 
@@ -98,9 +98,6 @@ def plot_phase_vs_subaperture(save_path: Path, bandwidth: float, n_subapertures:
         phase = -2 * np.pi * f * t0
         ax.plot(f, phase, color=color, lw=2, label=f'target at {dx:+.1f} px')
         ax.plot(sub_centers, -2 * np.pi * sub_centers * t0, 'o', color=color, ms=7, zorder=3)
-
-    for fc in sub_centers:
-        ax.axvline(fc, color='0.6', lw=1, ls='--', zorder=1)
 
     ax.set_xlabel('azimuth (Doppler) frequency (Hz)', fontsize=12)
     ax.set_ylabel('phase (rad)', fontsize=12)
