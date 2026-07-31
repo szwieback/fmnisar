@@ -87,11 +87,32 @@ def diffphase_statistics_slc(slc_sub):
     return _diffphase_from_nn_covariance(cv_nn, sub_axis=0)
     
 
+def point_target_score(slc_sub: np.ndarray, dphimean: np.ndarray) -> np.ndarray:
+    """Squared magnitude (R^2) of the correlation coefficient between the single-look
+    sub-aperture stack and the best-fitting point-target phasor exp(j*n*dphimean),
+    per pixel."""
+    n_sub = slc_sub.shape[0]
+    n = np.arange(n_sub).reshape((n_sub,) + (1,) * dphimean.ndim)
+    # dphimean follows diffphase_statistics_slc's convention: phase of x_n * conj(x_{n+1}),
+    # i.e. the negative of the true per-step increment, hence the minus sign here.
+    model = np.exp(-1j * n * dphimean[None, ...])
+    numerator = np.abs(np.sum(slc_sub * np.conj(model), axis=0)) ** 2
+    denominator = n_sub * np.sum(np.abs(slc_sub) ** 2, axis=0)
+    return numerator / denominator
+
+
 def normalized_variance(slc_sub: np.ndarray) -> np.ndarray:
     #Variance of single-look log-intensity across sub-apertures
     log_intensity = np.log(np.abs(slc_sub) ** 2)
     # log_intensity is Gumbel with Var = pi^2/6 for Gaussian speckle
     return log_intensity.var(axis=0, ddof=1)
+
+
+def normalized_variance_ml(covariance: np.ndarray) -> np.ndarray:
+    """Variance of multilooked log-power across sub-apertures, from a covariance matrix diagonal."""
+    diag_idx = np.arange(covariance.shape[0])
+    power = np.real(covariance[diag_idx, diag_idx])  # (n_sub, n_az_ml, n_rg_ml)
+    return np.log(power).var(axis=0, ddof=1)
 
 
 def intensity_to_rgb(

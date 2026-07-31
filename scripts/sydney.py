@@ -7,7 +7,8 @@ from subaperture import AzimuthSubaperture, SubapertureMetaData, plot_subapertur
 from ioput import read_block, latlon_box_to_radar_bbox
 from products import (
     multilook_intensity, intensity_to_rgb, coherence, covariance_matrix,
-    diffphase_statistics, diffphase_statistics_slc, entropy, normalized_variance, mean_coherence)
+    diffphase_statistics, diffphase_statistics_slc, entropy, normalized_variance,
+    normalized_variance_ml, mean_coherence, point_target_score)
 
 path_nisar = Path(
     '/media/simon/Extreme SSD/fmnisar/Sydney/'
@@ -100,6 +101,11 @@ def process_sydney(meta, n_subapertures):
         np.save(folder_out_n / f'{name}_subaperture_covariance_matrix.npy', cov)
         np.save(folder_out_n / f'{name}_subaperture_coherence_matrix.npy', coh)
 
+        # multilooked log-power variance across sub-apertures, from the covariance matrix diagonal
+        nv_ml = normalized_variance_ml(cov)
+        plt.imsave(folder_out_n / f'{name}_subaperture_normvariance_multilooked.png',
+                   nv_ml, cmap='magma', vmin=0, vmax=2)
+
         # mean coherence across all N-choose-2 sub-aperture pairs
         mean_coh_ml = mean_coherence(coh)
         plt.imsave(folder_out_n / f'{name}_subaperture_meancoherence_{az_looks}az{rg_looks}rg_looks.png',
@@ -122,7 +128,12 @@ def process_sydney(meta, n_subapertures):
                    V_full, cmap='gray', vmin=0, vmax=1)
         plt.imsave(folder_out_n / f'{name}_subaperture_phasemean_singlelook.png',
                    M_full, cmap='twilight_shifted', vmin=-np.pi, vmax=np.pi)
-        
+
+        # single-look point target score: correlation with the best-fitting phase ramp
+        pts = point_target_score(block_sub_baseband, M_full)
+        plt.imsave(folder_out_n / f'{name}_subaperture_pointtargetscore.png',
+                   pts, cmap='gray', vmin=0, vmax=1)
+
 
         # diagnostics: spectra and sub-aperture windows over the AOI block
         plot_subaperture_diagnostics(
