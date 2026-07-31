@@ -1,36 +1,45 @@
 import numpy as np
 
 
-def _boxcar_multilook(slc: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
-    # full stride, based on reshape
-    *lead, n_az, n_rg = slc.shape
+def boxcar(
+    arr: np.ndarray, looks: tuple[int, int], stride: tuple[int, int] | int | None = None
+) -> np.ndarray:
     az_looks, rg_looks = looks
-    n_az_ml = n_az // az_looks
-    n_rg_ml = n_rg // rg_looks
-    cropped = slc[..., :n_az_ml * az_looks, :n_rg_ml * rg_looks]
-    reshaped = cropped.reshape(*lead, n_az_ml, az_looks, n_rg_ml, rg_looks)
-    return reshaped.mean(axis=(-3, -1))
+    if stride is None:
+        stride = looks
+    elif isinstance(stride, int):
+        stride = (stride, stride)
+    az_stride, rg_stride = stride
+    windows = np.lib.stride_tricks.sliding_window_view(arr, (az_looks, rg_looks), axis=(-2, -1))
+    windows = windows[..., ::az_stride, ::rg_stride, :, :]
+    return windows.mean(axis=(-2, -1))
 
 
-def coherence(slc1: np.ndarray, slc2: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
-    _, coherence = covariance_pair(slc1, slc2, looks)
+def coherence(
+    slc1: np.ndarray, slc2: np.ndarray, looks: tuple[int, int],
+    stride: tuple[int, int] | int | None = None,
+) -> np.ndarray:
+    _, coherence = covariance_pair(slc1, slc2, looks, stride)
     return coherence
 
 
 def covariance_pair(
-    slc1: np.ndarray, slc2: np.ndarray, looks: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
-    covariance = _boxcar_multilook(slc1 * np.conj(slc2), looks) # complex
-    power_a = _boxcar_multilook(np.abs(slc1) ** 2, looks)
-    power_b = _boxcar_multilook(np.abs(slc2) ** 2, looks)
+    slc1: np.ndarray, slc2: np.ndarray, looks: tuple[int, int],
+    stride: tuple[int, int] | int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    covariance = boxcar(slc1 * np.conj(slc2), looks, stride) # complex
+    power_a = boxcar(np.abs(slc1) ** 2, looks, stride)
+    power_b = boxcar(np.abs(slc2) ** 2, looks, stride)
     coherence = np.abs(covariance) / np.sqrt(power_a * power_b) # magnitude
     return covariance, coherence
 
 
 def covariance_matrix(
-        slc_sub: np.ndarray, looks: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    slc_sub: np.ndarray, looks: tuple[int, int], stride: tuple[int, int] | int | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Full pairwise complex covariance and coherence-magnitude matrices across a look stack.
     slc_sub is a complex look stack of shape (n_sub, n_az, n_rg)
-    
+
     Returns
     -------
     covariance : numpy.ndarray, complex, shape (n_sub, n_sub, n_az_ml, n_rg_ml)
@@ -38,7 +47,7 @@ def covariance_matrix(
     """
     n_sub = slc_sub.shape[0]
     outer = slc_sub[:, None, :, :] * np.conj(slc_sub[None, :, :, :])
-    covariance = _boxcar_multilook(outer, looks)
+    covariance = boxcar(outer, looks, stride)
     diag_idx = np.arange(n_sub)
     power = np.real(covariance[diag_idx, diag_idx])
     covariance[diag_idx, diag_idx] = power
@@ -53,8 +62,10 @@ def mean_coherence(coherence_matrix: np.ndarray) -> np.ndarray:
     return coherence_matrix[iu].mean(axis=0)
 
 
-def multilook_intensity(slc_sub: np.ndarray, looks: tuple[int, int]) -> np.ndarray:
-    return _boxcar_multilook(np.abs(slc_sub) ** 2, looks)
+def multilook_intensity(
+    slc_sub: np.ndarray, looks: tuple[int, int], stride: tuple[int, int] | int | None = None
+) -> np.ndarray:
+    return boxcar(np.abs(slc_sub) ** 2, looks, stride)
 
 
 def entropy(covariance: np.ndarray) -> np.ndarray:
