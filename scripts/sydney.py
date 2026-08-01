@@ -30,6 +30,18 @@ az_looks, rg_looks = 9, 9
 stride = 3
 gamma = 2.5
 
+quantity_style = {
+    'normalized_variance':    dict(cmap='magma', vmin=0, vmax=5),
+    'normalized_variance_ml': dict(cmap='magma', vmin=0, vmax=2),
+    'coherence':              dict(cmap='gray', vmin=0, vmax=1),
+    'mean_coherence':         dict(cmap='gray', vmin=0, vmax=1),
+    'entropy':                dict(cmap='magma', vmin=0, vmax=1),
+    'phase_variance':         dict(cmap='gray', vmin=0, vmax=1),
+    'phase_mean':             dict(cmap='twilight_shifted', vmin=-np.pi, vmax=np.pi),
+    'point_target_score':     dict(cmap='gray', vmin=0, vmax=1),
+}
+
+
 def process_sydney(meta, n_subapertures):
     sub = AzimuthSubaperture(
         meta, n_subapertures=n_subapertures, overlap=overlap,
@@ -76,7 +88,7 @@ def process_sydney(meta, n_subapertures):
         # log-intensity variance across sub-apertures
         nv = normalized_variance(block_sub)
         plt.imsave(folder_out_n / f'{name}_subaperture_normvariance.png',
-                   nv, cmap='magma', vmin=0, vmax=5)
+                   nv, **quantity_style['normalized_variance'])
 
         # multilooked RGB composite
         intensity_ml = multilook_intensity(block_sub[rgb_idx], (az_looks, rg_looks), stride=stride)
@@ -94,7 +106,7 @@ def process_sydney(meta, n_subapertures):
                 block_sub_variant[i], block_sub_variant[j], (az_looks, rg_looks), stride=1)
             plt.imsave(
                 folder_out_n / f'{name}_subaperture_coherence_look{i + 1}{j + 1}_{tag}.png',
-                coh, cmap='gray', vmin=0, vmax=1)
+                coh, **quantity_style['coherence'])
 
         # full pairwise covariance/coherence matrix, baseband subapertures only
         cov, coh = covariance_matrix(
@@ -105,35 +117,35 @@ def process_sydney(meta, n_subapertures):
         # multilooked log-power variance across sub-apertures, from the covariance matrix diagonal
         nv_ml = normalized_variance_ml(cov)
         plt.imsave(folder_out_n / f'{name}_subaperture_normvariance_multilooked.png',
-                   nv_ml, cmap='magma', vmin=0, vmax=2)
+                   nv_ml, **quantity_style['normalized_variance_ml'])
 
         # mean coherence across all N-choose-2 sub-aperture pairs
         mean_coh_ml = mean_coherence(coh)
         plt.imsave(folder_out_n / f'{name}_subaperture_meancoherence_{az_looks}az{rg_looks}rg_looks.png',
-                   mean_coh_ml, cmap='gray', vmin=0, vmax=1)
+                   mean_coh_ml, **quantity_style['mean_coherence'])
 
-        # entropy of the sub-aperture covariance spectrum, in [0, log(n_subapertures)]
+        # entropy of the sub-aperture covariance spectrum, in [0, 1]
         H = entropy(cov)
         plt.imsave(folder_out_n / f'{name}_subaperture_entropy.png',
-                   H, cmap='magma', vmin=0, vmax=np.log(n_subapertures))
+                   H, **quantity_style['entropy'])
 
         M, V = diffphase_statistics(cov)
         plt.imsave(folder_out_n / f'{name}_subaperture_phasevariance.png',
-                   V, cmap='gray', vmin=0, vmax=1)
+                   V, **quantity_style['phase_variance'])
         plt.imsave(folder_out_n / f'{name}_subaperture_phasemean.png',
-                   M, cmap='twilight_shifted', vmin=-np.pi, vmax=np.pi)
+                   M, **quantity_style['phase_mean'])
 
         # full-resolution phase mean/variance directly from the baseband subaperture SLC stack
         M_full, V_full = diffphase_statistics_slc(block_sub_baseband)
         plt.imsave(folder_out_n / f'{name}_subaperture_phasevariance_singlelook.png',
-                   V_full, cmap='gray', vmin=0, vmax=1)
+                   V_full, **quantity_style['phase_variance'])
         plt.imsave(folder_out_n / f'{name}_subaperture_phasemean_singlelook.png',
-                   M_full, cmap='twilight_shifted', vmin=-np.pi, vmax=np.pi)
+                   M_full, **quantity_style['phase_mean'])
 
         # single-look point target score: correlation with the best-fitting phase ramp
         pts = point_target_score(block_sub_baseband, M_full)
         plt.imsave(folder_out_n / f'{name}_subaperture_pointtargetscore.png',
-                   pts, cmap='gray', vmin=0, vmax=1)
+                   pts, **quantity_style['point_target_score'])
 
 
         # diagnostics: spectra and sub-aperture windows over the AOI block
@@ -145,7 +157,76 @@ def process_sydney(meta, n_subapertures):
         # sub_baseband.process_rslc(path_nisar, output_h5, pols=[pol])
 
 
+def _read_area_block(meta, area):
+    aoi_width_km, aoi_height_km = area['aoi_extent_km']
+    bbox = latlon_box_to_radar_bbox(
+        path_nisar, area['lon_center'], area['lat_center'], aoi_width_km, aoi_height_km)
+    block = read_block(
+        path_nisar, bbox['az_start'], bbox['az_stop'], bbox['rg_start'], bbox['rg_stop'], pol=pol)
+    return bbox, block
+
+
+def _baseband_subaperture_block(meta, block, bbox, n_subapertures):
+    sub_baseband = AzimuthSubaperture(
+        meta, n_subapertures=n_subapertures, overlap=overlap,
+        demodulate_subaperture=True, remodulate_to_full_dc=False, deweight_spectrum=True)
+    return sub_baseband._process_block(block, az_time_start=float(meta.az_time[bbox['az_start']]))
+
+
+def plot_ml_sweep(meta, area, quantity, n_subapertures_list, looks_list, stride=stride):
+    """Sweep n_subapertures x looks for a covariance-matrix quantity ('mean_coherence' or 'entropy')."""
+    style = quantity_style[quantity]
+    bbox, block = _read_area_block(meta, area)
+
+    fig, axes = plt.subplots(
+        len(n_subapertures_list), len(looks_list),
+        figsize=(3 * len(looks_list), 3 * len(n_subapertures_list)), squeeze=False)
+    for i, n_subapertures in enumerate(n_subapertures_list):
+        block_sub_baseband = _baseband_subaperture_block(meta, block, bbox, n_subapertures)
+        for j, looks in enumerate(looks_list):
+            cov, coh = covariance_matrix(block_sub_baseband, (looks, looks), stride=stride)
+            value = mean_coherence(coh) if quantity == 'mean_coherence' else entropy(cov)
+            ax = axes[i, j]
+            ax.imshow(value, cmap=style['cmap'], vmin=style['vmin'], vmax=style['vmax'])
+            ax.set_title(f'N={n_subapertures}, L={looks}')
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    fig.suptitle(f"{area['name']}: {quantity}")
+    fig.tight_layout()
+    fig.savefig(folder_out / f"{area['name']}_sweep_{quantity}.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_slc_sweep(meta, area, quantity, n_subapertures_list):
+    """Sweep n_subapertures for a single-look SLC quantity ('phase_variance' or 'point_target_score')."""
+    style = quantity_style[quantity]
+    bbox, block = _read_area_block(meta, area)
+
+    fig, axes = plt.subplots(1, len(n_subapertures_list), figsize=(3 * len(n_subapertures_list), 3), squeeze=False)
+    for j, n_subapertures in enumerate(n_subapertures_list):
+        block_sub_baseband = _baseband_subaperture_block(meta, block, bbox, n_subapertures)
+        M_full, V_full = diffphase_statistics_slc(block_sub_baseband)
+        value = V_full if quantity == 'phase_variance' else point_target_score(block_sub_baseband, M_full)
+        ax = axes[0, j]
+        ax.imshow(value, cmap=style['cmap'], vmin=style['vmin'], vmax=style['vmax'])
+        ax.set_title(f'N={n_subapertures}')
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(f"{area['name']}: {quantity}")
+    fig.tight_layout()
+    fig.savefig(folder_out / f"{area['name']}_sweep_{quantity}.png", dpi=150)
+    plt.close(fig)
+
+
 if __name__ == '__main__':
     meta = SubapertureMetaData.load_from_rslc_path(path_nisar)
-    for n_subapertures in (3, 5, 7, 9):
-        process_sydney(meta, n_subapertures)
+    # for n_subapertures in (3, 5, 7, 9):
+    #     process_sydney(meta, n_subapertures)
+
+    for area in study_areas:
+        for quantity in ('mean_coherence', 'entropy'):
+            plot_ml_sweep(meta, area, quantity, (3, 7, 11), (3, 7, 11))
+        for quantity in ('phase_variance', 'point_target_score'):
+            plot_slc_sweep(meta, area, quantity, (3, 7, 11, 15))
