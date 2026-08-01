@@ -69,12 +69,14 @@ def multilook_intensity(
 
 
 def entropy(covariance: np.ndarray) -> np.ndarray:
-    """Shannon entropy (nats) of the normalized covariance eigenvalue spectrum, per pixel."""
+    """Shannon entropy of the normalized covariance eigenvalue spectrum, per pixel, in [0, 1] (log_N base)."""
+    n_sub = covariance.shape[0]
     mat = np.moveaxis(covariance, (0, 1), (-2, -1))   # (n_az_ml, n_rg_ml, n_sub, n_sub)
     eigvals = np.linalg.eigvalsh(mat)
     eigvals = np.clip(eigvals, 0.0, None)
     p = eigvals / eigvals.sum(axis=-1, keepdims=True)
-    return -np.sum(p * np.log(np.where(p > 0, p, 1.0)), axis=-1)  # (n_az_ml, n_rg_ml)
+    h = -np.sum(p * np.log(np.where(p > 0, p, 1.0)), axis=-1)  # (n_az_ml, n_rg_ml)
+    return h / np.log(n_sub)
 
 def _diffphase_from_nn_covariance(cv_nn, sub_axis=-1):
     """Inter-aperture phase mean/variance from nearest-neighbour covariances along sub_axis."""
