@@ -27,6 +27,7 @@ study_areas = [
 ]
 
 az_looks, rg_looks = 9, 9
+stride = 3
 gamma = 2.5
 
 def process_sydney(meta, n_subapertures):
@@ -78,7 +79,7 @@ def process_sydney(meta, n_subapertures):
                    nv, cmap='magma', vmin=0, vmax=5)
 
         # multilooked RGB composite
-        intensity_ml = multilook_intensity(block_sub[rgb_idx], (az_looks, rg_looks))
+        intensity_ml = multilook_intensity(block_sub[rgb_idx], (az_looks, rg_looks), stride=stride)
         rgb_ml = intensity_to_rgb(intensity_ml, gamma=gamma)
         plt.imsave(folder_out_n / f'{name}_subaperture_rgb_{az_looks}az{rg_looks}rg_looks.png', rgb_ml)
 
@@ -90,16 +91,16 @@ def process_sydney(meta, n_subapertures):
         for tag, block_sub_variant in (('nobaseband', block_sub), ('baseband', block_sub_baseband)):
             i, j = coherence_look_idx
             coh = coherence(
-                block_sub_variant[i], block_sub_variant[j], (az_looks, rg_looks))
+                block_sub_variant[i], block_sub_variant[j], (az_looks, rg_looks), stride=1)
             plt.imsave(
                 folder_out_n / f'{name}_subaperture_coherence_look{i + 1}{j + 1}_{tag}.png',
                 coh, cmap='gray', vmin=0, vmax=1)
 
         # full pairwise covariance/coherence matrix, baseband subapertures only
         cov, coh = covariance_matrix(
-            block_sub_baseband, (az_looks, rg_looks))
-        np.save(folder_out_n / f'{name}_subaperture_covariance_matrix.npy', cov)
-        np.save(folder_out_n / f'{name}_subaperture_coherence_matrix.npy', coh)
+            block_sub_baseband, (az_looks, rg_looks), stride=stride)
+        # np.save(folder_out_n / f'{name}_subaperture_covariance_matrix.npy', cov)
+        # np.save(folder_out_n / f'{name}_subaperture_coherence_matrix.npy', coh)
 
         # multilooked log-power variance across sub-apertures, from the covariance matrix diagonal
         nv_ml = normalized_variance_ml(cov)
