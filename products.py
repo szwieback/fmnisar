@@ -128,6 +128,46 @@ def normalized_variance_ml(covariance: np.ndarray) -> np.ndarray:
     return np.log(power).var(axis=0, ddof=1)
 
 
+def _orthogonal_quadratic_design(n_sub: int) -> tuple[np.ndarray, np.ndarray]:
+    """Centered linear and quadratic regressors over the discrete sub-aperture index,
+    mutually orthogonal (and orthogonal to a constant) by symmetry."""
+    if n_sub < 3:
+        raise ValueError(f"n_sub must be >= 3 for a quadratic fit, got {n_sub}")
+    n = np.arange(n_sub, dtype=float)
+    n -= n.mean()
+    return n, n ** 2 - np.mean(n ** 2)
+
+
+def _log_intensity_polynomial(log_intensity: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    lin, quad = _orthogonal_quadratic_design(log_intensity.shape[0])
+    linear = np.tensordot(lin, log_intensity, axes=(0, 0)) / np.sum(lin ** 2)
+    quadratic = np.tensordot(quad, log_intensity, axes=(0, 0)) / np.sum(quad ** 2)
+    return linear, quadratic
+
+
+def qdeviation(linear: np.ndarray, quadratic: np.ndarray, n_sub: int) -> np.ndarray:
+    """Maximum absolute difference, over sub-aperture index, between the fitted
+    linear+quadratic model and the intercept-only (mean) model, per pixel."""
+    lin, quad = _orthogonal_quadratic_design(n_sub)
+    shape = (n_sub,) + (1,) * linear.ndim
+    deviation = np.abs(linear[None, ...] * lin.reshape(shape) + quadratic[None, ...] * quad.reshape(shape))
+    return deviation.max(axis=0)
+
+
+def intensity_polynomial(slc_sub: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Linear and quadratic coefficients of single-look log-intensity across sub-apertures,
+    from orthogonal polynomial regression."""
+    log_intensity = np.log(np.abs(slc_sub) ** 2)
+    return _log_intensity_polynomial(log_intensity)
+
+
+def intensity_polynomial_ml(covariance: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """As intensity_polynomial, but from a multilooked covariance matrix diagonal."""
+    diag_idx = np.arange(covariance.shape[0])
+    power = np.real(covariance[diag_idx, diag_idx])  # (n_sub, n_az_ml, n_rg_ml)
+    return _log_intensity_polynomial(np.log(power))
+
+
 def intensity_to_rgb(
     intensity: np.ndarray, low_pct: float = 2.0, high_pct: float = 98.0, gamma: float = 1.0
 ) -> np.ndarray:
