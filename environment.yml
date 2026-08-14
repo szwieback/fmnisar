@@ -1,13 +1,13 @@
 # Conda environment for the fmnisar prototype pipeline.
 #
 #   conda env create -f environment.yml
-#   conda activate fmnisar
+#   conda activate isce3
 #
 # Direct imports across the repo (ioput.py, subaperture.py, simulation.py,
 # products.py, scripts/) are only: numpy, scipy, h5py, matplotlib, isce3.
 # Everything else here is either a transitive dependency worth naming
 # explicitly or a convenience tool for interactive work.
-name: fmnisar
+name: isce3
 
 channels:
   - conda-forge

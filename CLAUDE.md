@@ -8,10 +8,10 @@ Prototype pipeline for processing NISAR SAR data to generate pre-training datase
 
 ## Environment
 
-The project uses a conda environment named `fmnisar` (defined in `environment.yml`). Activate it before running anything:
+The project uses a conda environment named `isce3` (defined in `environment.yml`). Activate it before running anything:
 
 ```bash
-conda activate fmnisar
+conda activate isce3
 ```
 
 ## Key Domain Concepts
