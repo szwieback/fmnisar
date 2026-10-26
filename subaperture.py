@@ -111,19 +111,19 @@ class AzimuthSubaperture:
         return spectrum
 
     def _compute_subaperture_params(self, n, azimuth_bandwidth, zero_doppler_time_spacing):
-        """Compute DFT bin width, integer and fractional centroid positions, and useful-band bin range."""
+        """Compute DFT bin width, non-integer sub-aperture centroid bins, and useful-band bin range."""
         fraction_useful = azimuth_bandwidth * zero_doppler_time_spacing * (1 - self.shrink_fraction_useful)
         bin_useful_lo = int(n * (1 - fraction_useful) // 2)
         bin_useful_hi = int(n * (1 + fraction_useful) // 2)
         bin_useful_width = bin_useful_hi - bin_useful_lo
         bin_width = int(bin_useful_width // (1 + (self.n_subapertures - 1) * (1 - self.overlap)))
         half_span = bin_width * (1 - self.overlap) * (self.n_subapertures - 1) / 2 # for both even and odd N
-        bin_centroids_frac = np.linspace(n // 2 - half_span, n // 2 + half_span, self.n_subapertures)
-        bin_centroids = np.round(bin_centroids_frac).astype(np.int64)
-        return bin_width, bin_centroids, bin_useful_lo, bin_useful_hi, bin_centroids_frac
+        # symmetric and equally spaced about n // 2
+        bin_centroids = np.linspace(n // 2 - half_span, n // 2 + half_span, self.n_subapertures)
+        return bin_width, bin_centroids, bin_useful_lo, bin_useful_hi
 
     def _build_deweight_profile(self, avg_power, bin_useful_lo, bin_useful_hi, bin_width, eps=1e-6):
-        """Smoothed inverse-sqrt correction from avg_power (~taper**2) within the useful band; 1 elsewhere."""
+        """Smoothed correction from avg_power within the useful band; 1 elsewhere."""
         smooth_bins = self.deweight_smooth_bins or max(bin_width // 16, 1)
         segment = avg_power[bin_useful_lo:bin_useful_hi]
         smoothed = uniform_filter1d(segment, size=smooth_bins, mode='nearest')
@@ -155,13 +155,14 @@ class AzimuthSubaperture:
             doppler_centroid = dc_for_block(az_start, az_stop, rg_start, rg_stop)
             block = read_block(rslc_path, az_start, az_stop, rg_start, rg_stop, freq=freq, pol=pol)
             block_zp = self._zero_pad(block)
-            block_zp, _ = self._demodulate_slc(block_zp, doppler_centroid, self.meta.zero_doppler_time_spacing)
+            block_zp, _ = self._demodulate_slc(
+                block_zp, doppler_centroid, self.meta.zero_doppler_time_spacing)
             spectrum = fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
             power_sum += np.sum(np.abs(spectrum) ** 2, axis=1)
             n_rg_total += rg_stop - rg_start
 
         avg_power = power_sum / n_rg_total
-        bin_width, _, bin_useful_lo, bin_useful_hi, _ = self._compute_subaperture_params(
+        bin_width, _, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
             n_az_padded, self.meta.azimuth_bandwidth, self.meta.zero_doppler_time_spacing)
         self._deweight_profile = self._build_deweight_profile(
             avg_power, bin_useful_lo, bin_useful_hi, bin_width)
@@ -172,11 +173,8 @@ class AzimuthSubaperture:
         win_energy = float(np.sum(win.astype(np.float64) ** 2))
         if win_energy < eps:
             warnings.warn(
-                "Sub-aperture window has ~zero passband energy; skipping gain "
-                "normalization for this window.",
-                UserWarning,
-                stacklevel=3,
-            )
+                "Sub-aperture window has near-zero passband energy; skipping normalization",
+                UserWarning, stacklevel=3)
             return 1.0
         return np.sqrt(bin_useful_width / win_energy)
 
@@ -192,14 +190,12 @@ class AzimuthSubaperture:
                 spectrum_sub[j] *= np.float32(scale)
         return spectrum_sub
 
-    def _invert_subapertures(self, spectrum_sub, bin_centroids_frac, modulation, n_orig):
+    def _invert_subapertures(self, spectrum_sub, bin_centroids, modulation, n_orig):
         """Inverse-FFT sub-aperture spectra to baseband, crop to n_orig lines, optionally remodulate."""
         n = spectrum_sub.shape[1]
         block_sub = ifft(ifftshift(spectrum_sub, axes=1), axis=1, workers=-1)
         if self.demodulate_subaperture:
-            # fractional (un-rounded) centroids: near the mid-array peak an integer-rounded
-            # centroid carries ~pi/bin of residual phase, jittering the inter-look phase ramp
-            for j, centroid in enumerate(bin_centroids_frac):
+            for j, centroid in enumerate(bin_centroids):
                 sub_mod = np.exp(2j * np.pi * (centroid - n // 2) * np.arange(n) / n)
                 block_sub[j] *= sub_mod.conj()[:, np.newaxis]
         if self.remodulate_to_full_dc:
@@ -224,13 +220,12 @@ class AzimuthSubaperture:
         block_zp = self._zero_pad(block)
         block_zp, modulation = self._demodulate_slc(
             block_zp, doppler_centroid, zero_doppler_time_spacing, az_time_start=az_time_start)
-        bin_width, bin_centroids, bin_useful_lo, bin_useful_hi, bin_centroids_frac = \
-            self._compute_subaperture_params(
-                block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
+        bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
+            block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
         spectrum = self._compute_spectrum(block_zp, bin_useful_lo, bin_useful_hi, bin_width)
         bin_useful_width = bin_useful_hi - bin_useful_lo
         spectrum_sub = self._apply_subaperture_windows(spectrum, bin_centroids, bin_width, bin_useful_width)
-        return self._invert_subapertures(spectrum_sub, bin_centroids_frac, modulation, n_orig)
+        return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, n_orig)
 
     def _build_dc_interpolator(self) -> RegularGridInterpolator:
         return RegularGridInterpolator(
@@ -346,32 +341,21 @@ class AzimuthSubaperture:
 
 # TODO: shares Tukey/raised-cosine kernel with ISCE3 range split-spectrum
 def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
-    """Construct a raised-cosine bandpass window of length n in DFT bin space.
+    """Raised-cosine bandpass with roll-off beta over n DFT bins centered at n//2; bin_centroid may be non-integer."""
+    dist = np.abs(np.arange(n) - bin_centroid)
+    half_width = bin_width / 2
+    rolloff_hwidth = beta * bin_width / 2
+    flat_hwidth = half_width - rolloff_hwidth
 
-    Unity in the flat passband, raised-cosine taper in the transition
-    regions, zero outside. Bin indices are in fftshift order (DC at n//2);
-    beta is the roll-off fraction (0 = rectangular, 1 = full cosine taper).
-    """
+    # clips at array edges; may change to circular
     rc = np.zeros(n, dtype=np.float32)
-    bin_rolloff_hwidth = int((beta * bin_width) // 2)
-
-    bin_left_cutoff  = bin_centroid - bin_width // 2
-    bin_left_flat    = bin_left_cutoff + bin_rolloff_hwidth
-    bin_right_flat   = bin_centroid + bin_width // 2 - bin_rolloff_hwidth
-    bin_right_cutoff = bin_centroid + bin_width // 2
-
-    # clips; may change to circular
-    rc[max(0, bin_left_flat):min(n, bin_right_flat)] = 1.0
-
-    if bin_rolloff_hwidth > 0:
-        i_left = np.arange(max(0, bin_left_cutoff), min(n, bin_left_flat))
-        if len(i_left):
-            rc[i_left] = 0.5 * (1 + np.cos(np.pi * (bin_left_flat - i_left) / bin_rolloff_hwidth))
-
-        i_right = np.arange(max(0, bin_right_flat), min(n, bin_right_cutoff))
-        if len(i_right):
-            rc[i_right] = 0.5 * (1 + np.cos(np.pi * (i_right - bin_right_flat) / bin_rolloff_hwidth))
-
+    rc[dist < flat_hwidth] = 1.0
+    if rolloff_hwidth > 0:
+        in_taper = (dist >= flat_hwidth) & (dist < half_width)
+        rc[in_taper] = 0.5 * (1 + np.cos(np.pi * (dist[in_taper] - flat_hwidth) / rolloff_hwidth))
+    else:
+        # half weight at exact edges keeps the rectangle symmetric
+        rc[np.isclose(dist, half_width)] = 0.5
     return rc
 
 
@@ -403,7 +387,7 @@ def plot_subaperture_diagnostics(
     block_zp_dm, _ = sub._demodulate_slc(block_zp, doppler_centroid, zero_doppler_time_spacing)
 
     n = block_zp.shape[0]
-    bin_width, bin_centroids, bin_useful_lo, bin_useful_hi, _ = sub._compute_subaperture_params(
+    bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = sub._compute_subaperture_params(
         n, azimuth_bandwidth, zero_doppler_time_spacing)
     bin_useful_width = bin_useful_hi - bin_useful_lo
     spectrum = sub._compute_spectrum(block_zp_dm, bin_useful_lo, bin_useful_hi, bin_width)
@@ -420,12 +404,11 @@ def plot_subaperture_diagnostics(
     else:
         slc_input = block
 
-    if demodulate and not sub.demodulate_subaperture:
-        # block_subaperture still carries the scene Doppler centroid; remove it for display.
+    if demodulate and sub.remodulate_to_full_dc:
+        # still at native Doppler centroid; demodulate for display
         mod_sub = np.exp(-2j * np.pi * doppler_centroid * np.arange(n_az_sub) * zero_doppler_time_spacing)
         sub_input = block_subaperture * mod_sub[np.newaxis, :, np.newaxis]
     else:
-        # sub.demodulate_subaperture already shifted each sub-aperture to its own baseband.
         sub_input = block_subaperture
 
     slc_spec = np.mean(
@@ -469,7 +452,7 @@ def plot_subaperture_diagnostics(
     bin_indices = np.arange(n)
     max_weight = 1.0
     for centroid, color in zip(bin_centroids, colors):
-        win = construct_raised_cosine(n, int(centroid), int(bin_width), beta=sub.raised_cosine_beta)
+        win = construct_raised_cosine(n, centroid, bin_width, beta=sub.raised_cosine_beta)
         if sub.normalize_window_gain:
             scale = sub._window_gain_scale(win, bin_useful_width)
             win = win * scale
