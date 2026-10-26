@@ -50,19 +50,19 @@ quantity_style = {
 
 
 def process_sydney(meta, n_subapertures):
-    sub = AzimuthSubaperture(
-        meta, n_subapertures=n_subapertures, overlap=overlap,
-        demodulate_subaperture=False, remodulate_to_full_dc=True, deweight_spectrum=True)
-    sub_baseband = AzimuthSubaperture(
-        meta, n_subapertures=n_subapertures, overlap=overlap,
-        demodulate_subaperture=True, remodulate_to_full_dc=False, deweight_spectrum=True)
-
     folder_out_n = folder_out / f'N{n_subapertures}'
     folder_out_n.mkdir(parents=True, exist_ok=True)
     rgb_idx = [0, n_subapertures // 2, n_subapertures - 1]
 
     for area in study_areas:
         name = area['name']
+        # fresh instances per area so de-weighting is estimated from this area's block
+        sub = AzimuthSubaperture(
+            meta, n_subapertures=n_subapertures, overlap=overlap,
+            demodulate_subaperture=False, remodulate_to_full_dc=True, deweight_spectrum=True)
+        sub_baseband = AzimuthSubaperture(
+            meta, n_subapertures=n_subapertures, overlap=overlap,
+            demodulate_subaperture=True, remodulate_to_full_dc=False, deweight_spectrum=True)
 
         aoi_width_km, aoi_height_km = area['aoi_extent_km']
         bbox = latlon_box_to_radar_bbox(
