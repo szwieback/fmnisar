@@ -10,15 +10,7 @@ _earth_radius = 6371000.0
 
 
 def read_block(path, az_start, az_stop, rg_start, rg_stop, freq='A', pol='HH'):
-    """Read a 2D block from an RSLC file.
-
-    az_start/az_stop, rg_start/rg_stop are azimuth/range indices (stop
-    exclusive); None for az_start/az_stop means full azimuth extent.
-
-    Returns
-    -------
-    np.ndarray, shape (az_stop - az_start, rg_stop - rg_start), complex64
-    """
+    """Complex64 block [az_start:az_stop, rg_start:rg_stop] of an RSLC; None is full extent."""
     ds_path = f'science/LSAR/RSLC/swaths/frequency{freq}/{pol}'
     with h5py.File(path, 'r') as fh:
         if ds_path not in fh:
@@ -74,32 +66,16 @@ def _box_corners(lon0, lat0, width_km, height_km):
     return lons, lats
 
 
-def latlon_box_to_radar_bbox(
-    rslc_path: Path,
-    lon0: float,
-    lat0: float,
-    width_km: float,
-    height_km: float,
-    height_m: float = 0.0,
-    freq: str = 'A',
-) -> dict:
-    """Find the azimuth-line / range-bin bounding box covering a lon/lat area.
+def read_grid_shape(path, freq='A') -> tuple:
+    """(n_az, n_rg) of the full-resolution RSLC grid."""
+    with h5py.File(path, 'r') as fh:
+        n_az = len(fh['science/LSAR/RSLC/swaths/zeroDopplerTime'])
+        n_rg = len(fh[f'science/LSAR/RSLC/swaths/frequency{freq}/slantRange'])
+    return n_az, n_rg
 
-    Uses ISCE3 geo2rdr on the corners (and center) of the box on a
-    constant-height ellipsoid; adequate for a several-km AOI. width_km/
-    height_km are applied as an east-west/north-south box, a good enough
-    proxy for a square AOI since the exact range/azimuth orientation isn't
-    known a priori.
 
-    Returns
-    -------
-    bbox : dict
-        Keys ``az_start``, ``az_stop``, ``rg_start``, ``rg_stop`` (indices
-        into the full-resolution RSLC grid, stop exclusive).
-    """
-    rslc_path = Path(rslc_path)
-    lons, lats = _box_corners(lon0, lat0, width_km, height_km)
-
+def latlon_to_radar_index(rslc_path, lons, lats, height_m: float = 0.0, freq: str = 'A') -> tuple:
+    """Fractional (az_idx, rg_idx) of lon/lat points at constant ellipsoid height (geo2rdr)."""
     with h5py.File(rslc_path, 'r') as fh:
         orbit = isce3.core.load_orbit_from_h5_group(fh['science/LSAR/RSLC/metadata/orbit'])
         look = fh['science/LSAR/identification/lookDirection'][()]
@@ -113,22 +89,47 @@ def latlon_box_to_radar_bbox(
     doppler = isce3.core.LUT2d()
 
     aztimes, sranges = [], []
-    for lon, lat in zip(lons, lats):
+    for lon, lat in zip(np.atleast_1d(lons), np.atleast_1d(lats)):
         llh = np.array([np.radians(lon), np.radians(lat), height_m])
         xyz = ellipsoid.lon_lat_to_xyz(llh)
         aztime, srange = isce3.geometry.geo2rdr_bracket(xyz, orbit, doppler, wavelength, side)
         aztimes.append(aztime)
         sranges.append(srange)
 
+    aztimes, sranges = np.array(aztimes), np.array(sranges)
+    outside = ((aztimes < az_time[0]) | (aztimes > az_time[-1])
+               | (sranges < slant_range[0]) | (sranges > slant_range[-1]))
+    if np.any(outside):
+        raise ValueError(f'{np.sum(outside)} lon/lat point(s) fall outside the radar grid')
     az_idx = np.interp(aztimes, az_time, np.arange(len(az_time)))
     rg_idx = np.interp(sranges, slant_range, np.arange(len(slant_range)))
+    return az_idx, rg_idx
 
+
+def latlon_points_to_radar_bbox(rslc_path, lons, lats, height_m: float = 0.0,
+                                freq: str = 'A') -> dict:
+    """Azimuth/range bbox (stop exclusive) enclosing the radar positions of lon/lat points."""
+    az_idx, rg_idx = latlon_to_radar_index(rslc_path, lons, lats, height_m=height_m, freq=freq)
     return dict(
         az_start=int(np.floor(az_idx.min())),
         az_stop=int(np.ceil(az_idx.max())) + 1,
         rg_start=int(np.floor(rg_idx.min())),
         rg_stop=int(np.ceil(rg_idx.max())) + 1,
     )
+
+
+def latlon_box_to_radar_bbox(
+    rslc_path: Path,
+    lon0: float,
+    lat0: float,
+    width_km: float,
+    height_km: float,
+    height_m: float = 0.0,
+    freq: str = 'A',
+) -> dict:
+    """Radar bbox (stop exclusive) enclosing an E-W x N-S box [km] about (lon0, lat0)."""
+    lons, lats = _box_corners(lon0, lat0, width_km, height_km)
+    return latlon_points_to_radar_bbox(rslc_path, lons, lats, height_m=height_m, freq=freq)
 
 
 if __name__ == '__main__':

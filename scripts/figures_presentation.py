@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import numpy as np
-from scipy.fft import next_fast_len, fftfreq, fftshift
+from scipy.fft import next_fast_len
 import matplotlib.pyplot as plt
 
 from simulation import azimuth_fm_rate, simulate_phase_history, azimuth_compress, effective_velocity, wavelength
@@ -26,9 +26,9 @@ def subaperture_values(sub: AzimuthSubaperture, slc: np.ndarray, t: np.ndarray, 
     # evaluate subaperture slc at peak
     slc_sub = sub._process_block(slc[:, None], az_time_start=float(t[0]))[:, :, 0]
     n_pad = next_fast_len(slc.shape[0])
-    _, bin_centroids, _, _, _ = sub._compute_subaperture_params(
+    _, bin_centroids, _, _ = sub._compute_subaperture_params(
         n_pad, sub.meta.azimuth_bandwidth, sub.meta.zero_doppler_time_spacing)
-    freqs = fftshift(fftfreq(n_pad, d=sub.meta.zero_doppler_time_spacing))[bin_centroids]
+    freqs = (bin_centroids - n_pad // 2) / (n_pad * sub.meta.zero_doppler_time_spacing)
     return freqs, slc_sub[:, peak]
 
 
