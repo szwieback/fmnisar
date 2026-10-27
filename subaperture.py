@@ -428,13 +428,17 @@ def plot_subaperture_diagnostics(
     else:
         sub_input = block_subaperture
 
+    # Hann taper suppresses leakage from the block-edge discontinuity; power-preserving
+    taper = construct_raised_cosine(n_az_slc, (n_az_slc - 1) / 2, n_az_slc, beta=1.0)
+    taper = (taper / np.sqrt(np.mean(taper ** 2)))[:, np.newaxis]
+
     slc_spec = np.mean(
-        np.abs(fftshift(fft(slc_input, axis=0, workers=-1), axes=0)) ** 2, axis=1
+        np.abs(fftshift(fft(slc_input * taper, axis=0, workers=-1), axes=0)) ** 2, axis=1
     )
     n_sub = block_subaperture.shape[0]
     sub_specs = np.array([
         np.mean(
-            np.abs(fftshift(fft(sub_input[j], axis=0, workers=-1), axes=0)) ** 2, axis=1
+            np.abs(fftshift(fft(sub_input[j] * taper, axis=0, workers=-1), axes=0)) ** 2, axis=1
         )
         for j in range(n_sub)
     ])
