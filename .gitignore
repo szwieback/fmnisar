@@ -37,3 +37,6 @@ figures/
 *.npz
 *.SAFE/
 *.zip
+*.pptx
+
+scratch/
