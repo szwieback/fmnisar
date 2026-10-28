@@ -74,10 +74,16 @@ def read_grid_shape(path, freq='A') -> tuple:
     return n_az, n_rg
 
 
+def load_orbit(rslc_path) -> isce3.core.Orbit:
+    """Orbit of an RSLC from its metadata group."""
+    with h5py.File(rslc_path, 'r') as fh:
+        return isce3.core.load_orbit_from_h5_group(fh['science/LSAR/RSLC/metadata/orbit'])
+
+
 def latlon_to_radar_index(rslc_path, lons, lats, height_m: float = 0.0, freq: str = 'A') -> tuple:
     """Fractional (az_idx, rg_idx) of lon/lat points at constant ellipsoid height (geo2rdr)."""
+    orbit = load_orbit(rslc_path)
     with h5py.File(rslc_path, 'r') as fh:
-        orbit = isce3.core.load_orbit_from_h5_group(fh['science/LSAR/RSLC/metadata/orbit'])
         look = fh['science/LSAR/identification/lookDirection'][()]
         fc = float(fh[f'science/LSAR/RSLC/swaths/frequency{freq}/processedCenterFrequency'][()])
         slant_range = fh[f'science/LSAR/RSLC/swaths/frequency{freq}/slantRange'][()]
