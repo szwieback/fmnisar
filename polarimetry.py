@@ -48,8 +48,18 @@ def dualpol_h_alpha(
 
     # eq. 1: boxcar-average the outer products to get the 2x2 matrix J per pixel
     covariance, _ = covariance_matrix(stack, looks, stride)      # (2, 2, n_az_ml, n_rg_ml)
+    return dualpol_h_alpha_from_matrix(covariance)
+
+
+def dualpol_h_alpha_from_matrix(covariance: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dual-pol entropy, alpha and cross-co phase (Cloude 2007, eq. 2) from an averaged 2x2 matrix J.
+
+    covariance : complex, shape (2, 2, ...); the already averaged co-pol/cross-pol matrix, e.g.
+    from dualpol_h_alpha's boxcar or geocoded by area projection. Returns arrays of shape (...),
+    as described in dualpol_h_alpha.
+    """
     # eigh wants the matrix axes last, covariance_matrix puts them first, so move them
-    j = np.moveaxis(covariance, (0, 1), (-2, -1))                # (n_az_ml, n_rg_ml, 2, 2)
+    j = np.moveaxis(covariance, (0, 1), (-2, -1))                # (..., 2, 2)
 
     # eq. 2: eigendecompose every pixel's Hermitian 2x2 matrix in one call
     eigvals, eigvecs = np.linalg.eigh(j)

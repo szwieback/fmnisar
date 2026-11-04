@@ -1,9 +1,12 @@
 """Geocode sub-aperture chips onto a map grid with isce3.
 
-Complex sub-look stacks (N, n_az, n_rg) go through isce3.geocode.geocode_slc. Real
-multilooked products (B, n_az_ml, n_rg_ml) go through GeocodeFloat32 in area-projection
-mode, as GCOV does. Both paths share the chip's radar grid, one DEM and one geogrid, so
-the outputs overlay pixel for pixel.
+Complex sub-look stacks (N, n_az, n_rg) go through isce3.geocode.geocode_slc. Sub-look
+products are formed GCOV style: the sub-look covariance matrix is averaged over a sliding
+looks x looks radar window, its entries are area-projected (GeocodeFloat32 / GeocodeCFloat32),
+and intensity, mean coherence and entropy are computed from the projected matrix on the map
+grid. Averaging the linear matrix entries, not the nonlinear products, keeps the area
+projection exact. Both paths share the chip's radar grid, one DEM and one geogrid, so the
+outputs overlay pixel for pixel.
 
 The complex path assumes the stack is baseband (AzimuthSubaperture with
 demodulate_subaperture=True and remodulate_to_full_dc=False). A sub-look that still
@@ -15,11 +18,11 @@ import argparse
 
 import isce3
 import numpy as np
-from isce3.atmosphere.tec_product import tec_lut2d_from_json_srg
+from isce3.atmosphere.tec_product import tec_lut2d_from_json_az, tec_lut2d_from_json_srg
 from nisar.workflows.dumpconfig import point_to_epsg
 from osgeo import gdal, osr
 
-from products import covariance_matrix, entropy, mean_coherence, multilook_intensity
+from products import covariance_matrix, entropy, mean_coherence
 from subaperture import AzimuthSubaperture, SubapertureMetaData
 from ioput import _box_corners, load_orbit
 from subaperture_chip import ChipExtent, SubapertureChip
@@ -53,20 +56,25 @@ def box_geogrid(lon_min: float, lat_min: float, lon_max: float, lat_max: float,
     """Map grid of a lon/lat box at posting_m [m]: the envelope of its corners in local UTM.
 
     The projection follows the NISAR convention: UTM zone of the box centre, polar
-    stereographic beyond 60 deg latitude.
+    stereographic beyond 60 deg latitude. Start and end are snapped outward to multiples of
+    posting_m (as NISAR x_snap / y_snap do), so every grid in a projection shares one lattice.
     """
     epsg = point_to_epsg(0.5 * (lon_min + lon_max), 0.5 * (lat_min + lat_max))
     to_map = _transform(4326, epsg)
     corners = [(lon_min, lat_min), (lon_max, lat_min), (lon_min, lat_max), (lon_max, lat_max)]
     xy = np.array([to_map.TransformPoint(lon, lat)[:2] for lon, lat in corners])
-    x0, y1 = xy[:, 0].min(), xy[:, 1].max()
-    width = int(np.ceil((xy[:, 0].max() - x0) / posting_m))
-    length = int(np.ceil((y1 - xy[:, 1].min()) / posting_m))
+    # west and south edges round down, east and north edges round up
+    x0 = np.floor(xy[:, 0].min() / posting_m) * posting_m
+    x1 = np.ceil(xy[:, 0].max() / posting_m) * posting_m
+    y0 = np.floor(xy[:, 1].min() / posting_m) * posting_m
+    y1 = np.ceil(xy[:, 1].max() / posting_m) * posting_m
+    width = int(round((x1 - x0) / posting_m))
+    length = int(round((y1 - y0) / posting_m))
     return isce3.product.GeoGridParameters(x0, y1, posting_m, -posting_m, width, length, epsg)
 
 
 def chip_extent_for_geogrid(rslc_path, geogrid, orbit, dem, srange_correction: isce3.core.LUT2d,
-                            looks: tuple = None) -> ChipExtent:
+                            looks: tuple = None, az_time_correction: isce3.core.LUT2d = None) -> ChipExtent:
     """Radar extent whose geocoding fills geogrid without gaps.
 
     isce3 get_radar_bbox solves the geogrid perimeter at the lowest and highest DEM height
@@ -107,6 +115,9 @@ def chip_extent_for_geogrid(rslc_path, geogrid, orbit, dem, srange_correction: i
     if srange_correction.have_data:
         # the geocoder samples at geo2rdr range plus the correction, so cover its largest value
         pad_rg += int(np.ceil(np.abs(srange_correction.data).max() / scene.range_pixel_spacing))
+    if az_time_correction is not None and az_time_correction.have_data:
+        # likewise in azimuth: the geocoder samples at geo2rdr time plus the azimuth correction
+        pad_az += int(np.ceil(np.abs(az_time_correction.data).max() / scene.az_time_interval))
     return ChipExtent(max(bb.first_azimuth_line - pad_az, 0), min(bb.last_azimuth_line + 1 + pad_az, scene.length),
                       max(bb.first_range_sample - pad_rg, 0), min(bb.last_range_sample + 1 + pad_rg, scene.width))
 
@@ -131,8 +142,19 @@ def ionosphere_range_correction(rslc_path, tec_path, orbit, dem_path) -> isce3.c
     return lut
 
 
+def ionosphere_azimuth_correction(rslc_path, tec_path, orbit) -> isce3.core.LUT2d:
+    """Ionospheric azimuth time correction LUT [s] from the NISAR TEC product, as GSLC/GCOV apply it."""
+    # built over the whole scene grid, as for the range correction
+    scene_grid = isce3.product.RadarGridParameters(str(rslc_path), _freq)
+    fc = isce3.core.speed_of_light / scene_grid.wavelength
+    lut = tec_lut2d_from_json_az(str(tec_path), fc, orbit, scene_grid)
+    lut.bounds_error = False
+    return lut
+
+
 def geocode_complex(stack: np.ndarray, radar_grid, geogrid, orbit, dem_raster,
-                    srange_correction: isce3.core.LUT2d) -> tuple:
+                    srange_correction: isce3.core.LUT2d,
+                    az_time_correction: isce3.core.LUT2d = None) -> tuple:
     """Geocode a baseband sub-look stack (N, n_az, n_rg); returns (geo (N, ny, nx), mask)."""
     shape = (geogrid.length, geogrid.width)
     geo_blocks = [np.zeros(shape, dtype=np.complex64) for _ in stack]
@@ -145,16 +167,29 @@ def geocode_complex(stack: np.ndarray, radar_grid, geogrid, orbit, dem_raster,
         geo_blocks, rdr_blocks, dem_raster, radar_grid, geogrid, orbit,
         isce3.core.LUT2d(), isce3.core.LUT2d(), isce3.core.WGS84_ELLIPSOID,
         _threshold_geo2rdr, _numiter_geo2rdr, mask_block=mask, flatten=False,
-        srange_correction=srange_correction)
+        srange_correction=srange_correction,
+        az_time_correction=az_time_correction if az_time_correction is not None else isce3.core.LUT2d())
+    # get_radar_bbox bounds the grid at the box's max DEM height, so a grid just past the scene
+    # edge can still get a non-empty chip that covers nothing at the true terrain heights
+    if np.all(mask == 255):
+        raise ValueError('no radar sample of the chip maps onto the output grid: '
+                         'the grid is outside the scene at its DEM heights')
     return np.stack(geo_blocks), mask
 
 
-def geocode_real(bands: np.ndarray, radar_grid, geogrid, orbit, dem_raster,
-                 srange_correction: isce3.core.LUT2d) -> np.ndarray:
-    """Geocode real bands (B, n_az, n_rg) by area projection; returns (B, ny, nx) float32."""
-    bands = np.asarray(bands, dtype=np.float32)
+def geocode_area(bands: np.ndarray, radar_grid, geogrid, orbit, dem_raster,
+                 srange_correction: isce3.core.LUT2d,
+                 az_time_correction: isce3.core.LUT2d = None) -> np.ndarray:
+    """Geocode bands (B, n_az, n_rg) by area projection; returns (B, ny, nx) float32 or complex64.
+
+    Complex bands (covariance cross terms) go through GeocodeCFloat32, which averages the
+    complex values, so their phase must vary smoothly over a map pixel's footprint.
+    """
+    is_complex = np.iscomplexobj(bands)
+    bands = np.asarray(bands, dtype=np.complex64 if is_complex else np.float32)
+    gdal_type = gdal.GDT_CFloat32 if is_complex else gdal.GDT_Float32
     n_bands, n_az, n_rg = bands.shape
-    geocoder = isce3.geocode.GeocodeFloat32()
+    geocoder = isce3.geocode.GeocodeCFloat32() if is_complex else isce3.geocode.GeocodeFloat32()
     geocoder.orbit = orbit
     geocoder.ellipsoid = isce3.core.WGS84_ELLIPSOID
     geocoder.doppler = isce3.core.LUT2d()
@@ -164,13 +199,32 @@ def geocode_real(bands: np.ndarray, radar_grid, geogrid, orbit, dem_raster,
                      geogrid.width, geogrid.length, geogrid.epsg)
     # GeocodeFloat32 works on GDAL rasters, so the arrays go through in-memory GDAL datasets
     mem = gdal.GetDriverByName('MEM')
-    in_ds = mem.Create('', n_rg, n_az, n_bands, gdal.GDT_Float32)
+    in_ds = mem.Create('', n_rg, n_az, n_bands, gdal_type)
     in_ds.WriteArray(bands)
-    out_ds = mem.Create('', geogrid.width, geogrid.length, n_bands, gdal.GDT_Float32)
+    out_ds = mem.Create('', geogrid.width, geogrid.length, n_bands, gdal_type)
     geocoder.geocode(radar_grid, isce3.io.Raster(in_ds.this), isce3.io.Raster(out_ds.this), dem_raster,
                      output_mode=isce3.geocode.GeocodeOutputMode.AREA_PROJECTION,
-                     slant_range_correction=srange_correction)
+                     slant_range_correction=srange_correction,
+                     az_time_correction=az_time_correction if az_time_correction is not None else isce3.core.LUT2d())
     return out_ds.ReadAsArray().reshape(n_bands, geogrid.length, geogrid.width)
+
+
+def products_from_covariance(cov: np.ndarray) -> tuple:
+    """(intensity (N, ...), mean coherence, entropy) from a covariance matrix (N, N, ...).
+
+    Pixels with any non-finite entry (outside the radar coverage) come back NaN.
+    """
+    n_sub = cov.shape[0]
+    valid = np.all(np.isfinite(cov), axis=(0, 1))
+    # identity at invalid pixels so the eigen-decomposition runs; reset to NaN afterwards
+    cov = np.where(valid, cov, np.eye(n_sub).reshape((n_sub, n_sub) + (1,) * (cov.ndim - 2)))
+    power = np.real(np.diagonal(cov, axis1=0, axis2=1))       # (..., N)
+    power = np.moveaxis(power, -1, 0).copy()                    # (N, ...); diagonal() is read-only
+    coh = np.abs(cov) / np.sqrt(power[:, None] * power[None, :])
+    intensity, mean_coh, ent = power, mean_coherence(coh), entropy(cov)
+    for a in (intensity, mean_coh, ent):
+        a[..., ~valid] = np.nan
+    return intensity, mean_coh, ent
 
 
 def write_geotiff(path, data: np.ndarray, geogrid, band_names: list, metadata: dict) -> None:
@@ -201,9 +255,10 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
 
     Returns the two GeoTIFF paths. The radar extent comes from chip_extent_for_geogrid.
 
-    ionosphere=True applies the NISAR TEC slant range correction (tec_path, the scene's
-    NISAR_ANC_TEC JSON) in both geocoders. The RSLC carries the ionospheric delay, about
-    5 m slant at L-band, which plain geo2rdr ignores; see scratch/cr_range_delay_budget.py.
+    ionosphere=True applies the NISAR TEC slant range and azimuth time corrections (tec_path,
+    the scene's NISAR_ANC_TEC JSON) in both geocoders, as GSLC does. The RSLC carries the
+    ionospheric delay, about 5 m slant at L-band (scratch/cr_range_delay_budget.py), and an
+    azimuth shift of about 1 m (scratch/compare_gslc_rosamond.py), both ignored by plain geo2rdr.
     """
     if ionosphere and tec_path is None:
         raise ValueError('ionosphere=True needs tec_path (NISAR_ANC_TEC JSON); '
@@ -216,7 +271,9 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
     # an empty LUT means no slant range correction in the isce3 geocoders
     srange_lut = (ionosphere_range_correction(rslc_path, tec_path, orbit, dem_path) if ionosphere
                   else isce3.core.LUT2d())
-    extent = chip_extent_for_geogrid(rslc_path, geogrid, orbit, dem, srange_lut, looks=(looks, looks))
+    az_lut = ionosphere_azimuth_correction(rslc_path, tec_path, orbit) if ionosphere else isce3.core.LUT2d()
+    extent = chip_extent_for_geogrid(rslc_path, geogrid, orbit, dem, srange_lut, looks=(looks, looks),
+                                     az_time_correction=az_lut)
     print(f'geogrid EPSG:{geogrid.epsg}, {geogrid.length} x {geogrid.width} at {geogrid.spacing_x} m; '
           f'radar extent {extent}')
 
@@ -233,20 +290,27 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
           f'sub-look bandwidth {bandwidth_hz:.1f} Hz')
 
     grid_full = chip_radar_grid(rslc_path, extent)
-    # isce3 shifts the multilooked origin by (looks - 1) / 2, matching products.boxcar window centres
-    grid_ml = grid_full.multilook(looks, looks)
 
     if ionosphere:
-        print(f'ionospheric slant range correction at chip centre: '
-              f'{srange_lut.eval(grid_full.sensing_mid, grid_full.mid_range):.2f} m')
+        print(f'ionospheric corrections at chip centre: slant range '
+              f'{srange_lut.eval(grid_full.sensing_mid, grid_full.mid_range):.2f} m, azimuth '
+              f'{az_lut.eval(grid_full.sensing_mid, grid_full.mid_range) * 1e6:.1f} us')
 
+    # sub-look k was demodulated by exp(-j 2 pi f_dc t) exp(-j 2 pi df_k (t - t_ref)), t in seconds
+    # since az_time_epoch; reramp a map pixel by the conjugate at the azimuth time the geocoder
+    # sampled: geo2rdr time plus the azimuth correction when ionosphere=True.
+    # repr keeps full float precision: f_dc multiplies absolute time (~1e4 s)
+    az_time_ref = float(meta.az_time[extent.center[0]])  # same reference SubapertureChip.process uses
     common = dict(rslc=rslc_path.name, dem=Path(dem_path).name, pol=pol,
                   az_start=extent.az_start, rg_start=extent.rg_start,
                   n_subapertures=n_subapertures, overlap=overlap,
-                  chip_doppler_centroid_hz=f'{chip.doppler_centroid:.3f}',
-                  sublook_centroid_offsets_hz=' '.join(f'{c:.3f}' for c in centroids_hz),
+                  chip_doppler_centroid_hz=repr(float(chip.doppler_centroid)),
+                  sublook_centroid_offsets_hz=' '.join(repr(float(c)) for c in centroids_hz),
+                  az_time_ref_s=repr(az_time_ref),
+                  az_time_epoch=grid_full.ref_epoch.isoformat(),
                   sublook_bandwidth_hz=f'{bandwidth_hz:.3f}', baseband=True,
-                  ionosphere_correction=ionosphere,
+                  ionosphere_range_correction=ionosphere,
+                  ionosphere_azimuth_correction=ionosphere,
                   tec=Path(tec_path).name if ionosphere else '')
     # product name through the acquisition start time (cycle, track, frame, mode, date)
     stem = '_'.join(rslc_path.stem.split('_')[:12]) + f'_{name}'
@@ -254,19 +318,27 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
     products_path = folder_out / f'{stem}_products.tif'
     sub_names = [f'sublook_{j}' for j in range(n_subapertures)]
 
-    geo_stack, mask = geocode_complex(stack, grid_full, geogrid, orbit, dem_raster, srange_lut)
+    geo_stack, mask = geocode_complex(stack, grid_full, geogrid, orbit, dem_raster, srange_lut, az_lut)
     print(f'complex: {np.mean(mask != 255) * 100:.1f}% of map pixels covered')
     write_geotiff(sublooks_path, geo_stack, geogrid, sub_names, dict(common, flatten=False))
 
-    # multilooked products on the (looks, looks) grid: per-sub-look intensity, mean coherence, entropy
-    intensity = multilook_intensity(stack, (looks, looks))
-    cov, coh = covariance_matrix(stack, (looks, looks))
-    bands = np.concatenate([intensity, mean_coherence(coh)[None], entropy(cov)[None]])
-    geo_bands = geocode_real(bands, grid_ml, geogrid, orbit, dem_raster, srange_lut)
-    print(f'real: {np.mean(np.isfinite(geo_bands[0])) * 100:.1f}% of map pixels covered')
+    # sub-look covariance averaged over a looks x looks window sliding one pixel at a time
+    cov, _ = covariance_matrix(stack, (looks, looks), stride=1)
+    # each window value sits at its centre, (looks - 1) / 2 in from the chip edge
+    half = (looks - 1) // 2
+    grid_cov = grid_full.offset_and_resize(half, half, cov.shape[-2], cov.shape[-1])
+    # area-project the upper triangle (diagonal included); the lower is its conjugate
+    iu = np.triu_indices(n_subapertures)
+    geo_upper = geocode_area(cov[iu], grid_cov, geogrid, orbit, dem_raster, srange_lut, az_lut)
+    geo_cov = np.zeros((n_subapertures, n_subapertures) + geo_upper.shape[1:], dtype=np.complex64)
+    geo_cov[iu] = geo_upper
+    geo_cov[iu[1], iu[0]] = np.conj(geo_upper)
+    intensity, mean_coh, ent = products_from_covariance(geo_cov)
+    geo_bands = np.concatenate([intensity, mean_coh[None], ent[None]]).astype(np.float32)
+    print(f'products: {np.mean(np.isfinite(geo_bands[0])) * 100:.1f}% of map pixels covered')
     write_geotiff(products_path, geo_bands, geogrid,
                   [f'intensity_{n}' for n in sub_names] + ['mean_coherence', 'entropy'],
-                  dict(common, looks=looks))
+                  dict(common, looks=looks, products_from='area-projected sliding-window covariance'))
     return sublooks_path, products_path
 
 
