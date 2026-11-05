@@ -1,18 +1,27 @@
 import numpy as np
+from scipy.ndimage import uniform_filter
 
 
 def boxcar(
     arr: np.ndarray, looks: tuple[int, int], stride: tuple[int, int] | int | None = None
 ) -> np.ndarray:
+    if np.count_nonzero(np.isnan(arr)) > 0:
+        raise ValueError('boxcar input contains NaN')
     az_looks, rg_looks = looks
     if stride is None:
         stride = looks
     elif isinstance(stride, int):
         stride = (stride, stride)
     az_stride, rg_stride = stride
-    windows = np.lib.stride_tricks.sliding_window_view(arr, (az_looks, rg_looks), axis=(-2, -1))
-    windows = windows[..., ::az_stride, ::rg_stride, :, :]
-    return windows.mean(axis=(-2, -1))
+    if not np.issubdtype(arr.dtype, np.inexact):
+        arr = arr.astype(np.float64)
+    size = (1,) * (arr.ndim - 2) + (az_looks, rg_looks)
+    mean = uniform_filter(arr, size=size, mode='constant')
+    # keep complete windows only, indexed like sliding_window_view; scipy centres at size // 2
+    az_half, rg_half = az_looks // 2, rg_looks // 2
+    az_end = arr.shape[-2] - (az_looks - 1 - az_half)
+    rg_end = arr.shape[-1] - (rg_looks - 1 - rg_half)
+    return mean[..., az_half:az_end:az_stride, rg_half:rg_end:rg_stride]
 
 
 def coherence(
