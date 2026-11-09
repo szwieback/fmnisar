@@ -1,9 +1,10 @@
-"""1-D azimuth simulation: raw point-target phase history, matched-filter SLC, and sub-aperture looks."""
+"""Azimuth simulation: 1-D point-target phase history and matched-filter SLC, 2-D band-limited
+speckle SLC, and their sub-aperture looks."""
 
 from pathlib import Path
 
 import numpy as np
-from scipy.fft import fft, ifft, fftshift, next_fast_len
+from scipy.fft import fft, ifft, ifft2, fftshift, fftfreq, next_fast_len
 
 from subaperture import SubapertureMetaData, AzimuthSubaperture, plot_subaperture_diagnostics
 
@@ -59,6 +60,33 @@ def azimuth_compress(raw: np.ndarray, dt: float, fm_rate: float, bandwidth: floa
     replica = azimuth_chirp(t, fm_rate, bandwidth, doppler_centroid, t0=0.0)
     # frequency-domain cross-correlation; fftshift moves the zero-lag peak to the centre sample
     slc = fftshift(ifft(fft(raw) * np.conj(fft(replica))))
+    return slc.astype(np.complex64)
+
+
+def simulate_speckle(shape: tuple, dt: float, azimuth_bandwidth: float, doppler_centroid: float,
+                     range_fraction: float = 1.0, seed: int = None) -> np.ndarray:
+    """Pure speckle SLC (n_az, n_rg): circular Gaussian scatterers band-limited like an RSLC.
+
+    The azimuth spectrum is flat over azimuth_bandwidth [Hz] about doppler_centroid [Hz], wrapped
+    to the PRF 1/dt. The range spectrum is flat over the central range_fraction of the sampling
+    band (processed range bandwidth / range sampling rate). Unit mean intensity.
+    """
+    n_az, n_rg = shape
+    rng = np.random.default_rng(seed)
+    # azimuth frequency relative to the Doppler centroid, wrapped into [-PRF/2, PRF/2)
+    prf = 1.0 / dt
+    f_rel = (fftfreq(n_az, d=dt) - doppler_centroid + prf / 2) % prf - prf / 2
+    keep_az = np.abs(f_rel) <= azimuth_bandwidth / 2
+    # range frequency in cycles per sample; the RSLC range band is centred on zero
+    keep_rg = np.abs(fftfreq(n_rg)) <= range_fraction / 2
+    if not (keep_az.any() and keep_rg.any()):
+        raise ValueError('pass band is narrower than one DFT bin; increase shape or the bandwidths')
+    # the DFT of white circular Gaussian noise is white circular Gaussian, so draw the spectrum directly
+    spectrum = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2)
+    spectrum *= keep_az[:, None] & keep_rg[None, :]
+    slc = ifft2(spectrum)
+    # band-limiting removes power; rescale to unit mean intensity
+    slc /= np.sqrt(np.mean(np.abs(slc) ** 2))
     return slc.astype(np.complex64)
 
 

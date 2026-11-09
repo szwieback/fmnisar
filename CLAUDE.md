@@ -70,6 +70,33 @@ Contents:
    being selected). Fix: demodulate each look by its centre frequency with a common reference time.
 3. sarpyx conjugates and azimuth-flips looks, reversing the sign of the phase differences. This does
    not affect the metrics.
+4. WARNING: sarpyx's dask path corrupts IW looks (`subaperture_full_img.py`, commit `ba2bf57`, code
+   present since `baa1fa4`). `_ifftshift_freq_axis` applies `ifftshift` per dask chunk before the
+   rechunk, so each look moves by about half the line rate (243 Hz) and its band halves swap. sarpyx
+   picks dask automatically when its peak memory estimate exceeds half of available RAM (32.5 GB
+   estimated for a full IW swath), so results depend on the machine. Measured on two S1 blocks: the
+   look nearest Nyquist loses about 17-26 % power at terrain correction, gamma12 drops 3-20 %, and
+   per-pixel features barely correlate with the numpy path. Fix: pass `force_dask=False` to
+   `do_subaps`; a global `ifftshift` then matches numpy to rounding error. Whether Juan's reference
+   run was affected is not known.
+5. Minor: sarpyx can de-weight IW data with the wrong swath's Hamming coefficient
+   (`sarpyx/processor/core/meta.py:84,104`, commit `ba2bf57`). `Handler` takes the first annotation
+   file from an unsorted `os.walk`, so the value depends on filesystem order. The azimuth coefficient
+   is 0.70 for IW1 and 0.75 for IW2 and IW3; 4 of the 7 S1 AOIs used the wrong one in our run. It
+   barely changes `local_shift` (up to 9 Hz). Its effect on the look split and features is not
+   measured. `AzimBand` comes from the same file; other uses of those values are not traced.
+6. sarpyx's `local_shift` can discard about half the IW azimuth band
+   (`sarpyx/processor/core/subaperture_full_img.py:729,1183,1225`, commit `ba2bf57`, code present
+   since `baa1fa4`). After `iw_roll_shift` has centered the spectrum, it rolls again to put the peak
+   of the de-weighted, nearly flat profile at the window center, but `ss` and `ee` stay fixed, so
+   signal moved past them is lost. On both the numpy and dask paths, and on by default
+   (`iw_doppler_centroid_correction=True`). Measured on VV: shifts of about 145 Hz keep 53-57 % of
+   the power in AOI 30, 2, 20 and 23, where the peak is at the band edge; AOI 26 shifts -95 Hz and
+   keeps 95 %, and IW1 AOI 33 and 10 shift 9-16 Hz and keep over 99 %. Using the correct Hamming
+   coefficient (flaw 5) does not remove these shifts. The shift is not rolled back, but it is common
+   to all looks, so it should cancel in inter-look features. Its effect on the selected `W` is not
+   measured; that needs a full run with `iw_doppler_centroid_correction=False`. Whether Juan's run
+   had it on is not known.
 
 `subaperture.py` already avoids 1 and 2: `AzimuthSubaperture` uses equally spaced centroids
 (`_compute_subaperture_params`) and per-look demodulation with a common reference line
