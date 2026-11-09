@@ -17,7 +17,7 @@ from subaperture_chip import azimuth_margin
 @dataclass
 class S1Burst:
     """One IW burst: raw and deramped SLC (n_az, n_rg), with the metadata for AzimuthSubaperture."""
-    slc: np.ndarray            # complex64, as stored; invalid samples are 0
+    slc: np.ndarray            # complex64, DN or sigma0 amplitude (see read_burst); invalid samples are 0
     deramped: np.ndarray       # complex64, azimuth spectrum stationary and centered at 0 Hz
     valid: np.ndarray          # bool (n_az, n_rg), samples inside the burst's valid region
     meta: SubapertureMetaData  # doppler centroid is 0 because the burst is deramped
@@ -95,14 +95,35 @@ def deramp_phase(root, burst, tau: np.ndarray, n_az: int, dt: float) -> np.ndarr
     return np.pi * k_t * (eta - eta_ref) ** 2 + 2 * np.pi * f_dc * (eta - eta_ref)
 
 
+def sigma0_lut(safe, swath: str, pol: str, burst_index: int, n_az: int, n_rg: int) -> np.ndarray:
+    """Sigma0 calibration amplitude (n_az, n_rg) of one burst; sigma0 complex amplitude = DN / LUT."""
+    pattern = f'calibration-s1?-{swath.lower()}-slc-{pol.lower()}-*.xml'
+    files = sorted((Path(safe) / 'annotation' / 'calibration').glob(pattern))
+    if not files:
+        raise FileNotFoundError(f'no {swath} {pol} calibration annotation in {safe}')
+    vectors = ET.parse(files[0]).getroot().findall('calibrationVectorList/calibrationVector')
+    table_lines = np.array([int(v.find('line').text) for v in vectors], dtype=float)
+    samples = np.arange(n_rg)
+    # each vector is sparse in range: fill it across the swath, then interpolate between vectors along azimuth
+    table = np.array([np.interp(samples, _floats(v.find('pixel').text), _floats(v.find('sigmaNought').text)) for v in vectors])
+    if not 100 < np.median(table) < 1000:
+        raise ValueError(f'sigma0 calibration median {np.median(table):.1f} outside the S1 IW range')
+    swath_lines = burst_index * n_az + np.arange(n_az)   # calibration vectors index lines of the swath TIFF
+    return np.array([np.interp(swath_lines, table_lines, table[:, j]) for j in range(n_rg)], dtype=np.float32).T
+
+
 def n_bursts(safe, swath: str, pol: str = 'VV') -> int:
     """Number of bursts in one swath."""
     root = ET.parse(_files(safe, swath, pol)[0]).getroot()
     return len(root.findall('swathTiming/burstList/burst'))
 
 
-def read_burst(safe, swath: str, burst_index: int, pol: str = 'VV') -> S1Burst:
-    """Burst burst_index (0-based) of swath ('IW2') from a SAFE folder, raw and deramped."""
+def read_burst(safe, swath: str, burst_index: int, pol: str = 'VV', sigma0: bool = False) -> S1Burst:
+    """Burst burst_index (0-based) of swath ('IW2') from a SAFE folder, raw and deramped.
+
+    With sigma0=True samples are sigma0 complex amplitude (DN / sigma0 LUT, as S1 calibration defines it);
+    otherwise they are the stored DN.
+    """
     xml_path, tiff_path = _files(safe, swath, pol)
     root = ET.parse(xml_path).getroot()
     n_az = int(root.find('swathTiming/linesPerBurst').text)
@@ -134,6 +155,8 @@ def read_burst(safe, swath: str, burst_index: int, pol: str = 'VV') -> S1Burst:
     slc[~valid] = 0
 
     phase = deramp_phase(root, burst, tau, n_az, dt)
+    if sigma0:
+        slc = slc / sigma0_lut(safe, swath, pol, burst_index, n_az, n_rg)
     deramped = slc * np.exp(-1j * phase).astype(np.complex64)
 
     start = _time(burst.find('azimuthTime').text)
