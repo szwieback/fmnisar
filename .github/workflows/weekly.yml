@@ -1,0 +1,66 @@
+name: weekly
+
+# Runs the whole pipeline against a freshly generated synthetic RSLC once a week,
+# so upstream changes in isce3, numpy or scipy surface here rather than mid-analysis.
+on:
+  schedule:
+    - cron: '0 6 * * 1'      # Mondays, 06:00 UTC
+  workflow_dispatch:          # and on demand from the Actions tab
+  # to also check every commit, add:
+  # push:
+  # pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}   # a login shell, so the conda env is active
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda environment
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          environment-file: environment.yml
+          activate-environment: fmnisar
+
+      - name: Report versions
+        run: |
+          python -c "import isce3, numpy, scipy, h5py; \
+            print('isce3', isce3.__version__); \
+            print('numpy', numpy.__version__); \
+            print('scipy', scipy.__version__); \
+            print('h5py', h5py.__version__)"
+
+      - name: Run the pipeline suite
+        run: pytest tests/ -v --durations=10
+
+      # If the reference statistics disagree, regenerate them on this platform and
+      # publish the result. Download it, diff it, and commit it only if the change
+      # is one you meant to make.
+      - name: Regenerate reference statistics on failure
+        if: failure()
+        run: pytest tests/test_reference_values.py --update-reference -q || true
+
+      - name: Upload regenerated reference statistics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-values-${{ runner.os }}
+          path: tests/reference_values.json
+          retention-days: 30
+
+      - name: Build a copy of the synthetic RSLC for inspection
+        if: always()
+        run: python tests/make_test_rslc.py data/processed/test_rslc.h5
+
+      - name: Upload the synthetic RSLC
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-rslc
+          path: data/processed/test_rslc.h5
+          retention-days: 14
