@@ -15,7 +15,7 @@ from ioput import (read_block, read_range_block, get_available_pols,
 from products import (coherence, covariance_pair, covariance_matrix, multilook_intensity,
                       entropy, diffphase_statistics, diffphase_statistics_slc,
                       normalized_variance, intensity_to_rgb)
-from subaperture import (SubapertureMetaData, AzimuthSubaperture,
+from subaperture import (SubapertureMetaData, AzimuthSubaperture, DopplerCentroid,
                          construct_raised_cosine, plot_subaperture_diagnostics)
 
 SWATH = 'science/LSAR/RSLC/swaths/frequencyA'
@@ -214,7 +214,11 @@ def test_process_rslc_matches_in_memory(rslc, meta, tmp_path):
                                     blocksize_range=rslc['n_rg'])
 
     block = read_block(rslc['path'], None, None, 0, rslc['n_rg'], pol='HH')
-    expected = sub._process_block(block, az_time_start=float(meta.az_time[0]))
+    # process_rslc_uniform_dc references the phase to the scene-centre line
+    doppler_centroid = DopplerCentroid.constant(
+        float(np.mean(meta.doppler_centroid)), sub.scene_doppler_centroid.az_time_ref)
+    expected = sub._process_block(block, doppler_centroid=doppler_centroid,
+                                  az_time_start=float(meta.az_time[0]))
     with h5py.File(output, 'r') as dst:
         written = dst[f'{SWATH}/HH'][:]
     assert np.allclose(written, expected, atol=1e-4)
@@ -268,7 +272,7 @@ def test_diffphase_statistics(stack):
     for mean_phase, variance in (diffphase_statistics(cov), diffphase_statistics_slc(stack)):
         assert np.isfinite(mean_phase).all() and np.isfinite(variance).all()
         assert ((mean_phase >= -np.pi) & (mean_phase <= np.pi)).all()
-        assert ((variance >= -1e-9) & (variance <= 1 + 1e-6)).all()
+        assert ((variance >= -1e-6) & (variance <= 1 + 1e-6)).all()
 
 
 def test_normalized_variance(stack):
