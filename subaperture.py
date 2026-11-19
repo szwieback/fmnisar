@@ -1,10 +1,11 @@
 """Azimuth sub-aperture decomposition of NISAR RSLC data."""
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from scipy.fft import fft, ifft, fftshift, ifftshift, fftfreq, next_fast_len
-from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import uniform_filter1d
+import math
 import warnings
 import numpy as np
 import h5py
@@ -15,7 +16,7 @@ from ioput import read_block, get_available_pols, copy_h5_structure
 @dataclass
 class SubapertureMetaData:
     """Azimuth parameters needed to form subapertures from an RSLC product."""
-    zero_doppler_time_spacing: float   # seconds; 1/PRF
+    zero_doppler_time_spacing: float   # seconds; azimuth sampling interval
     azimuth_bandwidth: float           # Hz; processed azimuth bandwidth
     doppler_centroid: np.ndarray       # (n_az, n_rg) Hz; on the coarse grid
     doppler_az_time: np.ndarray        # (n_az,) zeroDopplerTime coords [s]
@@ -47,6 +48,81 @@ class SubapertureMetaData:
         """Load subaperture metadata from an RSLC HDF5 file path."""
         with h5py.File(path, 'r') as fh:
             return cls.load_from_rslc(fh, freq=freq)
+
+
+def _linear_bracket(knots, x):
+    """Left knot index and unclipped weight for linear interpolation that extrapolates."""
+    i = np.clip(np.searchsorted(knots, x, side='right') - 1, 0, len(knots) - 2)
+    return i, (x - knots[i]) / (knots[i + 1] - knots[i])
+
+
+@dataclass(frozen=True)
+class DopplerCentroid:
+    """Doppler centroid f_dc, bilinear in a LUT; phase 2 pi int f_dc dt from az_time_ref."""
+    az_time: np.ndarray       # (K,) LUT zeroDopplerTime knots [s]
+    slant_range: np.ndarray   # (M,) LUT slant-range knots [m]; M = 1 is range-independent
+    doppler: np.ndarray       # (K, M) Doppler centroid [Hz]
+    az_time_ref: float        # [s]; phase is zero here
+
+    @classmethod
+    def from_meta(cls, meta: SubapertureMetaData, az_time_ref: float = None) -> 'DopplerCentroid':
+        """RSLC Doppler centroid LUT; az_time_ref defaults to the scene-centre line."""
+        if az_time_ref is None:
+            az_time_ref = float(meta.az_time[len(meta.az_time) // 2])
+        return cls(meta.doppler_az_time, meta.doppler_slant_range, meta.doppler_centroid,
+                   float(az_time_ref))
+
+    @classmethod
+    def constant(cls, doppler_centroid_hz: float, az_time_ref: float) -> 'DopplerCentroid':
+        return cls(np.array([az_time_ref - 1.0, az_time_ref + 1.0]), np.array([0.0]),
+                   np.full((2, 1), float(doppler_centroid_hz)), float(az_time_ref))
+
+    @classmethod
+    def from_h5(cls, group: h5py.Group) -> 'DopplerCentroid':
+        return cls(group['az_time'][()], group['slant_range'][()], group['doppler'][()],
+                   float(group['az_time_ref'][()]))
+
+    def to_h5(self, group: h5py.Group) -> None:
+        for name in ('az_time', 'slant_range', 'doppler', 'az_time_ref'):
+            group.create_dataset(name, data=getattr(self, name))
+
+    @property
+    def is_constant(self) -> bool:
+        return bool(np.all(self.doppler == self.doppler.flat[0]))
+
+    @property
+    def range_dependent(self) -> bool:
+        return bool(np.any(np.diff(self.doppler, axis=1)))
+
+    def _at_range(self, slant_range):
+        """DC (K, m) at the azimuth knots and the given slant ranges."""
+        slant_range = np.atleast_1d(slant_range)
+        if len(self.slant_range) == 1:
+            return np.repeat(self.doppler, len(slant_range), axis=1)
+        j, w = _linear_bracket(self.slant_range, slant_range)
+        return self.doppler[:, j] * (1 - w) + self.doppler[:, j + 1] * w
+
+    def frequency(self, az_time, slant_range) -> np.ndarray:
+        """DC [Hz] on the grid az_time (n,) x slant_range (m,)."""
+        f_knots = self._at_range(slant_range)
+        i, w = _linear_bracket(self.az_time, np.atleast_1d(az_time))
+        return f_knots[i] * (1 - w)[:, None] + f_knots[i + 1] * w[:, None]
+
+    def phase(self, az_time, slant_range) -> np.ndarray:
+        """Doppler centroid phase [rad] on the grid az_time (n,) x slant_range (m,)."""
+        f_knots = self._at_range(slant_range)
+        dt_knots = np.diff(self.az_time)[:, None]
+        # exact integral of the piecewise-linear f_dc: trapezoids up to the knot, quadratic beyond
+        cycles_knots = np.concatenate([np.zeros((1, f_knots.shape[1])), np.cumsum(
+            0.5 * (f_knots[1:] + f_knots[:-1]) * dt_knots, axis=0)])
+
+        def cycles(t):
+            i, w = _linear_bracket(self.az_time, np.atleast_1d(t))
+            u = w[:, None] * dt_knots[i]
+            slope = (f_knots[i + 1] - f_knots[i]) / dt_knots[i]
+            return cycles_knots[i] + f_knots[i] * u + 0.5 * slope * u ** 2
+
+        return 2 * np.pi * (cycles(az_time) - cycles(self.az_time_ref))
 
 
 class AzimuthSubaperture:
@@ -85,13 +161,18 @@ class AzimuthSubaperture:
         block_zp[:block.shape[0], :] = block
         return block_zp
 
-    def _demodulate_slc(self, block_zp, doppler_centroid, zero_doppler_time_spacing,
-                        az_time_start=0.0):
-        """Centers spectrum using provided doppler_centroid"""
-        n = block_zp.shape[0]
-        az_time = az_time_start + np.arange(n) * zero_doppler_time_spacing
-        modulation = np.exp(2j * np.pi * doppler_centroid * az_time)
-        return block_zp * modulation.conj()[:, np.newaxis], modulation
+    @cached_property
+    def scene_doppler_centroid(self) -> DopplerCentroid:
+        """RSLC Doppler centroid LUT, phase referenced to the scene-centre line."""
+        return DopplerCentroid.from_meta(self.meta)
+
+    def _demodulate_slc(self, block_zp, doppler_centroid, az_time, slant_range):
+        """Demodulate by the Doppler centroid phase; returns (demodulated, modulation)."""
+        phase = doppler_centroid.phase(az_time, slant_range)
+        modulation = np.empty(phase.shape, dtype=np.complex64)
+        modulation.real = np.cos(phase)
+        modulation.imag = np.sin(phase)
+        return block_zp * modulation.conj(), modulation
 
     def _compute_spectrum(self, block_zp, bin_useful_lo=None, bin_useful_hi=None, bin_width=None):
         """Compute the azimuth DFT spectrum (centered), applying de-weighting if enabled."""
@@ -145,16 +226,13 @@ class AzimuthSubaperture:
         profile[bin_useful_lo:bin_useful_hi] = 1.0 / np.sqrt(shape)
         return profile
 
-    def estimate_deweighting_profile(self, rslc_path, az_start=0, az_stop=None, freq='A', pol=None,
-                                     blocksize_range=512, dc_for_block=None, rg_start=0,
-                                     rg_stop=None, doppler_centroid: float = None):
-        """Store de-weighting from mean power spectrum; doppler_centroid overrides dc_for_block."""
+    def estimate_deweighting_profile(self, rslc_path, doppler_centroid: DopplerCentroid = None,
+                                     az_start=0, az_stop=None, rg_start=0, rg_stop=None, freq='A',
+                                     pol=None, blocksize_range=512):
+        """Store de-weighting from the mean power spectrum; default scene_doppler_centroid."""
         rslc_path = Path(rslc_path)
-        if doppler_centroid is not None:
-            dc_for_block = lambda *_: doppler_centroid
-        elif dc_for_block is None:
-            mean_dc = float(np.mean(self.meta.doppler_centroid))
-            dc_for_block = lambda *_: mean_dc
+        if doppler_centroid is None:
+            doppler_centroid = self.scene_doppler_centroid
         with h5py.File(rslc_path, 'r') as fh:
             if pol is None:
                 pol = get_available_pols(fh, freq)[0]
@@ -165,16 +243,18 @@ class AzimuthSubaperture:
             rg_stop = n_rg
 
         n_az_padded = next_fast_len(az_stop - az_start)
+        az_time = (self.meta.az_time[az_start]
+                   + np.arange(n_az_padded) * self.meta.zero_doppler_time_spacing)
         power_sum = np.zeros(n_az_padded)
         n_rg_total = 0
         for rg_block_start in range(rg_start, rg_stop, blocksize_range):
             rg_block_stop = min(rg_block_start + blocksize_range, rg_stop)
-            block_dc = dc_for_block(az_start, az_stop, rg_block_start, rg_block_stop)
             block = read_block(rslc_path, az_start, az_stop, rg_block_start, rg_block_stop,
                                freq=freq, pol=pol)
             block_zp = self._zero_pad(block)
             block_zp, _ = self._demodulate_slc(
-                block_zp, block_dc, self.meta.zero_doppler_time_spacing)
+                block_zp, doppler_centroid, az_time,
+                self.meta.slant_range[rg_block_start:rg_block_stop])
             spectrum = fftshift(fft(block_zp, axis=0, workers=-1), axes=0)
             power_sum += np.sum(np.abs(spectrum) ** 2, axis=1)
             n_rg_total += rg_block_stop - rg_block_start
@@ -219,16 +299,19 @@ class AzimuthSubaperture:
                 sub_mod = np.exp(2j * np.pi * (centroid - n // 2) * lines / n)
                 block_sub[j] *= sub_mod.conj()[:, np.newaxis]
         if self.remodulate_to_full_dc:
-            block_sub *= modulation[np.newaxis, :, np.newaxis]
+            block_sub *= modulation[np.newaxis]
         return block_sub[:, :n_unpadded, :]
 
-    def _process_block(self, block, doppler_centroid=None, zero_doppler_time_spacing=None,
-                       azimuth_bandwidth=None, az_time_start=0.0, az_time_ref=None):
-        """Sub-apertures (N, n_az, n_rg); phase is zero at az_time_ref (default: block start)."""
-        if az_time_ref is None:
-            az_time_ref = az_time_start
+    def _process_block(self, block, doppler_centroid: DopplerCentroid = None, az_time_start=0.0,
+                       slant_range=None, zero_doppler_time_spacing=None, azimuth_bandwidth=None):
+        """Sub-apertures (N, n_az, n_rg); default DC: scene mean, phase zero at az_time_start."""
         if doppler_centroid is None:
-            doppler_centroid = float(np.mean(self.meta.doppler_centroid))
+            doppler_centroid = DopplerCentroid.constant(
+                float(np.mean(self.meta.doppler_centroid)), az_time_start)
+        if slant_range is None:
+            if doppler_centroid.range_dependent:
+                raise ValueError('a range-dependent Doppler centroid needs slant_range')
+            slant_range = np.zeros(block.shape[1])
         if zero_doppler_time_spacing is None:
             zero_doppler_time_spacing = self.meta.zero_doppler_time_spacing
         if azimuth_bandwidth is None:
@@ -236,31 +319,44 @@ class AzimuthSubaperture:
 
         n_unpadded = block.shape[0]
         block_zp = self._zero_pad(block)
+        az_time = az_time_start + np.arange(block_zp.shape[0]) * zero_doppler_time_spacing
         block_zp, modulation = self._demodulate_slc(
-            block_zp, doppler_centroid, zero_doppler_time_spacing, az_time_start=az_time_start)
+            block_zp, doppler_centroid, az_time, slant_range)
         bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = self._compute_subaperture_params(
             block_zp.shape[0], azimuth_bandwidth, zero_doppler_time_spacing)
         spectrum = self._compute_spectrum(block_zp, bin_useful_lo, bin_useful_hi, bin_width)
         bin_useful_width = bin_useful_hi - bin_useful_lo
         spectrum_sub = self._apply_subaperture_windows(
             spectrum, bin_centroids, bin_width, bin_useful_width)
-        az_line_offset = (az_time_start - az_time_ref) / zero_doppler_time_spacing
+        az_line_offset = (az_time_start - doppler_centroid.az_time_ref) / zero_doppler_time_spacing
         return self._invert_subapertures(spectrum_sub, bin_centroids, modulation, n_unpadded,
                                          az_line_offset=az_line_offset)
 
-    def _build_dc_interpolator(self) -> RegularGridInterpolator:
-        return RegularGridInterpolator(
-            (self.meta.doppler_az_time, self.meta.doppler_slant_range),
-            self.meta.doppler_centroid,
-            method='linear',
-            bounds_error=False,
-            fill_value=None,
-        )
+    def process_tile(self, rslc_path, az_start, az_stop, rg_start, rg_stop,
+                     doppler_centroid: DopplerCentroid = None, freq='A', pol='HH',
+                     az_margin=None):
+        """Sub-apertures (N, n_az, n_rg) of a tile, read with az_margin extra lines on each side."""
+        if freq != self.meta.freq:
+            raise ValueError(f'freq {freq} does not match metadata frequency {self.meta.freq}')
+        if doppler_centroid is None:
+            doppler_centroid = self.scene_doppler_centroid
+        if az_margin is None:
+            az_margin = azimuth_margin(self)
+        read_start = max(az_start - az_margin, 0)
+        read_stop = min(az_stop + az_margin, len(self.meta.az_time))
+        block = read_block(rslc_path, read_start, read_stop, rg_start, rg_stop, freq=freq, pol=pol)
+        block_sub = self._process_block(
+            block, doppler_centroid=doppler_centroid,
+            az_time_start=float(self.meta.az_time[read_start]),
+            slant_range=self.meta.slant_range[rg_start:rg_stop])
+        crop_start = az_start - read_start
+        return block_sub[:, crop_start:crop_start + az_stop - az_start, :]
 
     def interpolate_doppler_centroid(self, az_idx, rg_idx) -> float:
         """Doppler centroid [Hz] bilinearly interpolated at full-resolution (az_idx, rg_idx)."""
-        rgi = self._build_dc_interpolator()
-        return float(rgi([[self.meta.az_time[az_idx], self.meta.slant_range[rg_idx]]])[0])
+        f = self.scene_doppler_centroid.frequency(
+            self.meta.az_time[az_idx], self.meta.slant_range[rg_idx])
+        return float(f[0, 0])
 
     def _setup_output_h5(self, src, dst, freq, pols, n_az, n_rg, blocksize_range):
         swath_grp = src[f'science/LSAR/RSLC/swaths/frequency{freq}']
@@ -281,21 +377,33 @@ class AzimuthSubaperture:
         return out_swath
 
     @staticmethod
-    def _iter_blocks(n_az, n_rg, blocksize_az, blocksize_range):
-        az_starts = range(0, n_az, blocksize_az) if blocksize_az is not None else [0]
-        for az_start in az_starts:
-            az_stop = min(az_start + blocksize_az, n_az) if blocksize_az is not None else n_az
-            for rg_start in range(0, n_rg, blocksize_range):
-                yield az_start, az_stop, rg_start, min(rg_start + blocksize_range, n_rg)
+    def iter_tiles(az_start, az_stop, rg_start, rg_stop, blocksize_az=None, blocksize_rg=None):
+        """(az_start, az_stop, rg_start, rg_stop) tiles of an extent; None is one tile per axis."""
+        az_step = blocksize_az or az_stop - az_start
+        rg_step = blocksize_rg or rg_stop - rg_start
+        for az0 in range(az_start, az_stop, az_step):
+            for rg0 in range(rg_start, rg_stop, rg_step):
+                yield az0, min(az0 + az_step, az_stop), rg0, min(rg0 + rg_step, rg_stop)
 
-    def _run_blocks(self, rslc_path, output_h5, freq, pols, blocksize_range, blocksize_az,
-                    dc_for_block):
+    def process_rslc(
+        self,
+        rslc_path: Path,
+        output_h5: Path,
+        freq: str = 'A',
+        pols: list = None,
+        blocksize_range: int = 512,
+        blocksize_az: int = None,
+        doppler_centroid: DopplerCentroid = None,
+    ) -> None:
+        """Sub-aperture RSLC; default scene_doppler_centroid; pols=None means all."""
+        if doppler_centroid is None:
+            doppler_centroid = self.scene_doppler_centroid
         warnings.warn(
             "Output HDF5 metadata is copied verbatim from the NISAR RSLC source; "
             "product-level metadata (e.g. product type, doppler centroid) "
             "is not updated and needs to be reviewed and fixed.",
             UserWarning,
-            stacklevel=3,
+            stacklevel=2,
         )
         rslc_path = Path(rslc_path)
         with h5py.File(rslc_path, 'r') as src:
@@ -304,24 +412,21 @@ class AzimuthSubaperture:
             n_az, n_rg = src[f'science/LSAR/RSLC/swaths/frequency{freq}/{pols[0]}'].shape
             with h5py.File(output_h5, 'w') as dst:
                 out_swath = self._setup_output_h5(src, dst, freq, pols, n_az, n_rg, blocksize_range)
+                # read back with DopplerCentroid.from_h5 to rebuild the phase
+                doppler_centroid.to_h5(out_swath.create_group('subapertureDopplerCentroid'))
                 az_start_prev = None
-                az_time_ref = float(self.meta.az_time[n_az // 2])
                 for az_start, az_stop, rg_start, rg_stop in \
-                        self._iter_blocks(n_az, n_rg, blocksize_az, blocksize_range):
+                        self.iter_tiles(0, n_az, 0, n_rg, blocksize_az, blocksize_range):
                     if self.deweight_spectrum and az_start != az_start_prev:
                         self.estimate_deweighting_profile(
-                            rslc_path, az_start=az_start, az_stop=az_stop, freq=freq, pol=pols[0],
-                            blocksize_range=blocksize_range, dc_for_block=dc_for_block)
+                            rslc_path, doppler_centroid=doppler_centroid, az_start=az_start,
+                            az_stop=az_stop,
+                            freq=freq, pol=pols[0], blocksize_range=blocksize_range)
                         az_start_prev = az_start
-                    doppler_centroid = dc_for_block(az_start, az_stop, rg_start, rg_stop)
-                    az_time_start = float(self.meta.az_time[az_start])
                     for pol in pols:
-                        block = read_block(rslc_path, az_start, az_stop, rg_start, rg_stop,
-                                           freq=freq, pol=pol)
-                        sub_block = self._process_block(
-                            block, doppler_centroid=doppler_centroid, az_time_start=az_time_start,
-                            az_time_ref=az_time_ref)
-                        out_swath[pol][:, az_start:az_stop, rg_start:rg_stop] = sub_block
+                        out_swath[pol][:, az_start:az_stop, rg_start:rg_stop] = self.process_tile(
+                            rslc_path, az_start, az_stop, rg_start, rg_stop,
+                            doppler_centroid=doppler_centroid, freq=freq, pol=pol)
 
     def process_rslc_uniform_dc(
         self,
@@ -332,26 +437,17 @@ class AzimuthSubaperture:
         blocksize_range: int = 512,
     ) -> None:
         """Sub-aperture RSLC at the scene-mean Doppler centroid; pols=None means all."""
-        mean_doppler_centroid = float(np.mean(self.meta.doppler_centroid))
-        self._run_blocks(rslc_path, output_h5, freq, pols, blocksize_range,
-                         blocksize_az=None, dc_for_block=lambda *_: mean_doppler_centroid)
+        doppler_centroid = DopplerCentroid.constant(
+            float(np.mean(self.meta.doppler_centroid)), self.scene_doppler_centroid.az_time_ref)
+        self.process_rslc(rslc_path, output_h5, freq, pols, blocksize_range,
+                          doppler_centroid=doppler_centroid)
 
-    def process_rslc(
-        self,
-        rslc_path: Path,
-        output_h5: Path,
-        freq: str = 'A',
-        pols: list = None,
-        blocksize_range: int = 512,
-        blocksize_az: int = None,
-    ) -> None:
-        """Sub-aperture RSLC at block-centre Doppler centroids; blocksize_az=None is one block."""
-        def dc_for_block(az_start, az_stop, rg_start, rg_stop):
-            return self.interpolate_doppler_centroid(
-                (az_start + az_stop) // 2, (rg_start + rg_stop) // 2)
 
-        self._run_blocks(rslc_path, output_h5, freq, pols, blocksize_range,
-                         blocksize_az=blocksize_az, dc_for_block=dc_for_block)
+def azimuth_margin(sub: AzimuthSubaperture, n_widths: float = 6) -> int:
+    """Azimuth margin [pixels] of n_widths sub-aperture impulse-response widths."""
+    _, fraction_sub = sub._bandwidth_fractions(
+        sub.meta.azimuth_bandwidth, sub.meta.zero_doppler_time_spacing)
+    return math.ceil(n_widths / fraction_sub)
 
 
 # TODO: shares Tukey/raised-cosine kernel with ISCE3 range split-spectrum
@@ -377,7 +473,7 @@ def construct_raised_cosine(n, bin_centroid, bin_width, beta=0.5):
 def plot_subaperture_diagnostics(
     sub: AzimuthSubaperture,
     block: np.ndarray,
-    doppler_centroid: float = None,
+    doppler_centroid_hz: float = None,
     zero_doppler_time_spacing: float = None,
     azimuth_bandwidth: float = None,
     demodulate: bool = True,
@@ -385,23 +481,25 @@ def plot_subaperture_diagnostics(
 ):
     import matplotlib.pyplot as plt
 
-    if doppler_centroid is None:
-        doppler_centroid = float(np.mean(sub.meta.doppler_centroid))
+    if doppler_centroid_hz is None:
+        doppler_centroid_hz = float(np.mean(sub.meta.doppler_centroid))
     if zero_doppler_time_spacing is None:
         zero_doppler_time_spacing = sub.meta.zero_doppler_time_spacing
     if azimuth_bandwidth is None:
         azimuth_bandwidth = sub.meta.azimuth_bandwidth
 
+    doppler_centroid = DopplerCentroid.constant(doppler_centroid_hz, 0.0)
     block_subaperture = sub._process_block(
         block, doppler_centroid=doppler_centroid,
-        zero_doppler_time_spacing=zero_doppler_time_spacing,
-        azimuth_bandwidth=azimuth_bandwidth)
+        zero_doppler_time_spacing=zero_doppler_time_spacing, azimuth_bandwidth=azimuth_bandwidth)
 
     # DFT-domain: zero-pad, demodulate, compute spectrum and window params
     block_zp = sub._zero_pad(block)
-    block_zp_dm, _ = sub._demodulate_slc(block_zp, doppler_centroid, zero_doppler_time_spacing)
-
     n = block_zp.shape[0]
+    block_zp_dm, _ = sub._demodulate_slc(
+        block_zp, doppler_centroid, np.arange(n) * zero_doppler_time_spacing,
+        np.zeros(block.shape[1]))
+
     bin_width, bin_centroids, bin_useful_lo, bin_useful_hi = sub._compute_subaperture_params(
         n, azimuth_bandwidth, zero_doppler_time_spacing)
     bin_useful_width = bin_useful_hi - bin_useful_lo
@@ -415,7 +513,7 @@ def plot_subaperture_diagnostics(
 
     if demodulate:
         mod_slc = np.exp(
-            -2j * np.pi * doppler_centroid * np.arange(n_az_slc) * zero_doppler_time_spacing)
+            -2j * np.pi * doppler_centroid_hz * np.arange(n_az_slc) * zero_doppler_time_spacing)
         slc_input = block * mod_slc[:, np.newaxis]
     else:
         slc_input = block
@@ -423,7 +521,7 @@ def plot_subaperture_diagnostics(
     if demodulate and sub.remodulate_to_full_dc:
         # still at native Doppler centroid; demodulate for display
         mod_sub = np.exp(
-            -2j * np.pi * doppler_centroid * np.arange(n_az_sub) * zero_doppler_time_spacing)
+            -2j * np.pi * doppler_centroid_hz * np.arange(n_az_sub) * zero_doppler_time_spacing)
         sub_input = block_subaperture * mod_sub[np.newaxis, :, np.newaxis]
     else:
         sub_input = block_subaperture
