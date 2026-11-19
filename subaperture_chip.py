@@ -1,15 +1,14 @@
-"""Subaperture processing of a single chip with a constant chip-centre Doppler centroid."""
+"""Subaperture processing of a chip, by default at the chip-centre Doppler centroid."""
 
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-import math
 import warnings
 import numpy as np
 
 from ioput import (read_block, read_grid_shape, latlon_to_radar_index, latlon_points_to_radar_bbox,
                    latlon_box_to_radar_bbox)
-from subaperture import AzimuthSubaperture
+from subaperture import AzimuthSubaperture, DopplerCentroid, azimuth_margin
 
 
 def _interval_within(center: int, length: int, n: int) -> tuple:
@@ -74,18 +73,11 @@ class ChipExtent:
         return ChipExtent.from_center(*self.center, n_az, n_rg, n_az_scene, n_rg_scene)
 
 
-def azimuth_margin(sub: AzimuthSubaperture, n_widths: float = 6) -> int:
-    """Azimuth margin [pixels] of n_widths sub-aperture impulse-response widths."""
-    _, fraction_sub = sub._bandwidth_fractions(
-        sub.meta.azimuth_bandwidth, sub.meta.zero_doppler_time_spacing)
-    return math.ceil(n_widths / fraction_sub)
-
-
 class SubapertureChip:
-    """Chip sub-apertures at the chip-centre Doppler centroid and sub-aperture phase reference."""
+    """Chip sub-apertures; default Doppler centroid is the constant chip-centre value."""
 
     def __init__(self, sub: AzimuthSubaperture, rslc_path: Path, chip_extent: ChipExtent,
-                 freq='A', pol='HH'):
+                 freq='A', pol='HH', doppler_centroid: DopplerCentroid = None):
         if freq != sub.meta.freq:
             raise ValueError(f'freq {freq} does not match metadata frequency {sub.meta.freq}')
         self.sub = sub
@@ -93,15 +85,23 @@ class SubapertureChip:
         self.chip_extent = chip_extent
         self.freq = freq
         self.pol = pol
+        if doppler_centroid is None:
+            az_idx, rg_idx = chip_extent.center
+            doppler_centroid = DopplerCentroid.constant(
+                sub.interpolate_doppler_centroid(az_idx, rg_idx), float(sub.meta.az_time[az_idx]))
+        self.doppler_centroid = doppler_centroid
 
     @property
     def scene_shape(self) -> tuple:
         return len(self.sub.meta.az_time), len(self.sub.meta.slant_range)
 
     @cached_property
-    def doppler_centroid(self) -> float:
+    def doppler_centroid_hz(self) -> float:
         """Doppler centroid [Hz] at the chip centre."""
-        return self.sub.interpolate_doppler_centroid(*self.chip_extent.center)
+        az_idx, rg_idx = self.chip_extent.center
+        meta = self.sub.meta
+        return float(self.doppler_centroid.frequency(
+            meta.az_time[az_idx], meta.slant_range[rg_idx])[0, 0])
 
     def deweighting_extent(self, n_az_area: int, n_rg_area: int) -> ChipExtent:
         return self.chip_extent.resized(n_az_area, n_rg_area, *self.scene_shape)
@@ -110,40 +110,38 @@ class SubapertureChip:
         """Store sub's de-weighting profile from n_az_area x n_rg_area about the chip centre."""
         area = self.deweighting_extent(n_az_area, n_rg_area)
         return self.sub.estimate_deweighting_profile(
-            self.rslc_path, az_start=area.az_start, az_stop=area.az_stop,
-            rg_start=area.rg_start, rg_stop=area.rg_stop,
-            freq=self.freq, pol=self.pol, doppler_centroid=self.doppler_centroid)
+            self.rslc_path, doppler_centroid=self.doppler_centroid, az_start=area.az_start,
+            az_stop=area.az_stop, rg_start=area.rg_start, rg_stop=area.rg_stop, freq=self.freq,
+            pol=self.pol)
 
     def read(self) -> np.ndarray:
         e = self.chip_extent
         return read_block(self.rslc_path, e.az_start, e.az_stop, e.rg_start, e.rg_stop,
                           freq=self.freq, pol=self.pol)
 
-    def process(self, az_margin=None, deweight_area=(8192, 1024)) -> np.ndarray:
+    def process(self, az_margin=None, deweight_area=(8192, 1024), blocksize_az=None,
+                blocksize_rg=1024) -> np.ndarray:
         """Sub-aperture stack (N, n_az, n_rg); deweight_area=None reuses sub's de-weighting."""
         if self.sub.deweight_spectrum and deweight_area is not None:
             self.estimate_deweighting(*deweight_area)
         elif self.sub.deweight_spectrum and self.sub._deweight_profile is None:
-            warnings.warn('no de-weighting profile stored; estimating it from the chip block alone '
+            warnings.warn('no de-weighting profile stored; estimating it from the first tile alone '
                           '(noisy) and caching it on sub', UserWarning, stacklevel=2)
         if az_margin is None:
             az_margin = azimuth_margin(self.sub)
         e = self.chip_extent
         n_az_scene, _ = self.scene_shape
-        read_start = max(e.az_start - az_margin, 0)
-        read_stop = min(e.az_stop + az_margin, n_az_scene)
-        if read_start > e.az_start - az_margin or read_stop < e.az_stop + az_margin:
+        if e.az_start < az_margin or e.az_stop + az_margin > n_az_scene:
             warnings.warn(f'azimuth margin of {az_margin} pixels truncated at scene edge',
                           UserWarning, stacklevel=2)
-        block = read_block(self.rslc_path, read_start, read_stop, e.rg_start, e.rg_stop,
-                           freq=self.freq, pol=self.pol)
-        block_sub = self.sub._process_block(
-            block, doppler_centroid=self.doppler_centroid,
-            az_time_start=float(self.sub.meta.az_time[read_start]),
-            az_time_ref=float(self.sub.meta.az_time[self.chip_extent.center[0]]))
-        crop_start = e.az_start - read_start
-        n_az_chip, _ = e.shape
-        return block_sub[:, crop_start:crop_start + n_az_chip, :]
+        stack = np.empty((self.sub.n_subapertures,) + e.shape, dtype=np.complex64)
+        for az0, az1, rg0, rg1 in self.sub.iter_tiles(
+                e.az_start, e.az_stop, e.rg_start, e.rg_stop, blocksize_az, blocksize_rg):
+            stack[:, az0 - e.az_start:az1 - e.az_start, rg0 - e.rg_start:rg1 - e.rg_start] = \
+                self.sub.process_tile(self.rslc_path, az0, az1, rg0, rg1,
+                                      doppler_centroid=self.doppler_centroid, freq=self.freq,
+                                      pol=self.pol, az_margin=az_margin)
+        return stack
 
 
 if __name__ == '__main__':
@@ -162,12 +160,12 @@ if __name__ == '__main__':
 
     chip_extent = ChipExtent.from_latlon_area(path_nisar, 151.215256, -33.856784, 1.0, 1.0)
     chip = SubapertureChip(sub, path_nisar, chip_extent, pol='HH')
-    print(f'chip extent: {chip_extent}, DC: {chip.doppler_centroid:.2f} Hz, '
+    print(f'chip extent: {chip_extent}, DC: {chip.doppler_centroid_hz:.2f} Hz, '
           f'area extent: {chip.deweighting_extent(8192, 1024)}')
 
     block_sub = chip.process()
     print(f'chip stack shape: {block_sub.shape}')
 
     plot_subaperture_diagnostics(
-        sub, chip.read(), doppler_centroid=chip.doppler_centroid,
+        sub, chip.read(), doppler_centroid_hz=chip.doppler_centroid_hz,
         save_path=folder_out / 'chip_subaperture_diagnostics.png')

@@ -9,8 +9,8 @@ projection exact. Both paths share the chip's radar grid, one DEM and one geogri
 outputs overlay pixel for pixel.
 
 The complex path assumes the stack is baseband (AzimuthSubaperture with
-demodulate_subaperture=True and remodulate_to_full_dc=False). A sub-look that still
-carries its Doppler carrier would be aliased by the geocoding interpolator.
+demodulate_subaperture=True and remodulate_to_full_dc=False). A sub-look not demodulated
+by its Doppler centroid would be aliased by the geocoding interpolator.
 """
 
 from pathlib import Path
@@ -22,7 +22,7 @@ from isce3.atmosphere.tec_product import tec_lut2d_from_json_az, tec_lut2d_from_
 from nisar.workflows.dumpconfig import point_to_epsg
 from osgeo import gdal, osr
 
-from products import covariance_matrix, entropy, mean_coherence
+from products import boxcar, entropy, mean_coherence
 from subaperture import AzimuthSubaperture, SubapertureMetaData
 from ioput import _box_corners, load_orbit
 from subaperture_chip import ChipExtent, SubapertureChip
@@ -250,15 +250,14 @@ def write_geotiff(path, data: np.ndarray, geogrid, band_names: list, metadata: d
 
 def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
                  n_subapertures: int = 5, overlap: float = 0.2, looks: int = 9,
-                 pol: str = 'HH', tec_path=None, ionosphere: bool = True) -> tuple:
+                 pol: str = 'HH', tec_path=None, ionosphere: bool = True,
+                 blocksize_rg: int = 1024) -> tuple:
     """Sub-aperture process the radar extent that fills geogrid and geocode stack and products.
 
     Returns the two GeoTIFF paths. The radar extent comes from chip_extent_for_geogrid.
 
     ionosphere=True applies the NISAR TEC slant range and azimuth time corrections (tec_path,
-    the scene's NISAR_ANC_TEC JSON) in both geocoders, as GSLC does. The RSLC carries the
-    ionospheric delay, about 5 m slant at L-band (scratch/cr_range_delay_budget.py), and an
-    azimuth shift of about 1 m (scratch/compare_gslc_rosamond.py), both ignored by plain geo2rdr.
+    the scene's NISAR_ANC_TEC JSON) in both geocoders, as GSLC does.
     """
     if ionosphere and tec_path is None:
         raise ValueError('ionosphere=True needs tec_path (NISAR_ANC_TEC JSON); '
@@ -284,9 +283,9 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
     chip = SubapertureChip(sub, rslc_path, extent, pol=pol)
     # de-weighting area clamped so cropped RSLCs smaller than the default still work
     deweight_area = tuple(min(d, n) for d, n in zip((8192, 1024), chip.scene_shape))
-    stack = chip.process(deweight_area=deweight_area)
+    stack = chip.process(deweight_area=deweight_area, blocksize_rg=blocksize_rg)
     centroids_hz, bandwidth_hz = sublook_centroids_hz(sub)
-    print(f'sub-look stack {stack.shape}, chip DC {chip.doppler_centroid:.1f} Hz, '
+    print(f'sub-look stack {stack.shape}, chip DC {chip.doppler_centroid_hz:.1f} Hz, '
           f'sub-look bandwidth {bandwidth_hz:.1f} Hz')
 
     grid_full = chip_radar_grid(rslc_path, extent)
@@ -296,15 +295,17 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
               f'{srange_lut.eval(grid_full.sensing_mid, grid_full.mid_range):.2f} m, azimuth '
               f'{az_lut.eval(grid_full.sensing_mid, grid_full.mid_range) * 1e6:.1f} us')
 
-    # sub-look k was demodulated by exp(-j 2 pi f_dc t) exp(-j 2 pi df_k (t - t_ref)), t in seconds
-    # since az_time_epoch; reramp a map pixel by the conjugate at the azimuth time the geocoder
-    # sampled: geo2rdr time plus the azimuth correction when ionosphere=True.
-    # repr keeps full float precision: f_dc multiplies absolute time (~1e4 s)
-    az_time_ref = float(meta.az_time[extent.center[0]])  # same reference SubapertureChip.process uses
+    # sub-look k was demodulated by exp(-j (phi_dc(t, r) + 2 pi df_k (t - t_ref))), phi_dc =
+    # chip.doppler_centroid.phase, t in seconds since az_time_epoch. Remodulate at the (t, r) the
+    # geocoder sampled, ionospheric corrections included.
+    az_time_ref = chip.doppler_centroid.az_time_ref
+    dc_model = ('constant' if chip.doppler_centroid.is_constant
+                else 'RSLC frequencyA dopplerCentroid LUT, bilinear')
     common = dict(rslc=rslc_path.name, dem=Path(dem_path).name, pol=pol,
                   az_start=extent.az_start, rg_start=extent.rg_start,
                   n_subapertures=n_subapertures, overlap=overlap,
-                  chip_doppler_centroid_hz=repr(float(chip.doppler_centroid)),
+                  chip_doppler_centroid_hz=repr(chip.doppler_centroid_hz),
+                  doppler_centroid=dc_model,
                   sublook_centroid_offsets_hz=' '.join(repr(float(c)) for c in centroids_hz),
                   az_time_ref_s=repr(az_time_ref),
                   az_time_epoch=grid_full.ref_epoch.isoformat(),
@@ -322,14 +323,15 @@ def geocode_chip(rslc_path, dem_path, geogrid, name: str, folder_out,
     print(f'complex: {np.mean(mask != 255) * 100:.1f}% of map pixels covered')
     write_geotiff(sublooks_path, geo_stack, geogrid, sub_names, dict(common, flatten=False))
 
-    # sub-look covariance averaged over a looks x looks window sliding one pixel at a time
-    cov, _ = covariance_matrix(stack, (looks, looks), stride=1)
+    # upper triangle (with diagonal) of the sub-look covariance, looks x looks boxcar at stride 1;
+    # the lower triangle is its conjugate
+    iu = np.triu_indices(n_subapertures)
+    cov_upper = np.stack([boxcar(stack[i] * stack[j].conj(), (looks, looks), stride=1)
+                          for i, j in zip(*iu)])
     # each window value sits at its centre, (looks - 1) / 2 in from the chip edge
     half = (looks - 1) // 2
-    grid_cov = grid_full.offset_and_resize(half, half, cov.shape[-2], cov.shape[-1])
-    # area-project the upper triangle (diagonal included); the lower is its conjugate
-    iu = np.triu_indices(n_subapertures)
-    geo_upper = geocode_area(cov[iu], grid_cov, geogrid, orbit, dem_raster, srange_lut, az_lut)
+    grid_cov = grid_full.offset_and_resize(half, half, cov_upper.shape[-2], cov_upper.shape[-1])
+    geo_upper = geocode_area(cov_upper, grid_cov, geogrid, orbit, dem_raster, srange_lut, az_lut)
     geo_cov = np.zeros((n_subapertures, n_subapertures) + geo_upper.shape[1:], dtype=np.complex64)
     geo_cov[iu] = geo_upper
     geo_cov[iu[1], iu[0]] = np.conj(geo_upper)
